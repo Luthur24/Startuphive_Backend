@@ -17,8 +17,8 @@ def handle():
         auth  = request.headers.get('Authorization', '')
         if auth.startswith('Bearer '):
             token = auth[7:]
-        #result = M.Frontend_request_executor(x, token)
-        return jsonify(9)
+        result = M.Frontend_request_executor(x, token)
+        return jsonify(result)
     except Exception as e:
         return jsonify({'status': 500, 'message': str(e)}), 500
 
