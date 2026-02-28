@@ -45,7 +45,7 @@ Unauthorizedmessage                  = "Unauthorized. Please sign in."
 
 # ── PROFILE DEFAULTS ────────────────────────────────────────────
 defaultbiodescription = "Esse quam videri."
-defaultavatarurl      = ""
+defaultavatarurl      = "https://raw.githubusercontent.com/luthur24/Trends/main/volodymyr-dobrovolskyy-QlM0NtVqcgc-unsplash.jpg"
 
 # ── EMPTY STATE MESSAGES ────────────────────────────────────────
 nofollowingorfollowersgeneral = "<div class='empty-tab'>Nothing here yet.</div>"
