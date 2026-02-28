@@ -520,14 +520,10 @@ def drawerprofilenav(user):
     university = user.get('university', '')
     department = user.get('department', '')
     bio        = user.get('biodescription') or A.defaultbiodescription
-    pic        = user.get('profilepicurl') or ''
+    pic        = user.get('profilepicurl') or A.defaultavatarurl
     img_style  = "display:block;" if pic else "display:none;"
     initials   = ''.join([p[0].upper() for p in name.split()[:2]])
-    return f'''<a class="profilenav" onclick="document.getElementById('Messages').style.display='none',closeDrawer(),document.getElementById('profile').style.display='block',document.getElementById('Trending').style.display='none',document.getElementById('Research').style.display='none',document.getElementById('Explore').style.display='none',document.getElementById('Finance').style.display='none',document.getElementById('Board').style.display='none',document.getElementById('Settings').style.display='none';" href="#" style="height:10vh;top:0vh;border-bottom:1px solid #f0f8ff34;">
-<pib><img style="{img_style}" src="{pic}">{initials}</pib><un>{name}</un>
-<lr>{university} &bull; {department}</lr>
-<aside><marquee>{bio}</marquee></aside>
-</a>'''
+    return f'''<pib><img style="{img_style}" src="{pic}">{initials}</pib><div class="dr-info"><un>{name}</un><lr>{university} &bull; {department}</lr><aside><marquee>{bio}</marquee></aside></div>'''
 
 def profileinfo(user):
     name       = user['full_name']
@@ -555,7 +551,7 @@ def profilestats(user):
 <div><div class="stat-num">{fmt(posts)}</div><div class="stat-label">Posts</div></div>'''
 
 def get_avatar_html(user):
-    pic = user.get('profilepicurl') or ''
+    pic = user.get('profilepicurl') or A.defaultavatarurl
     return pic
 
 def settings_payload(user):
@@ -567,13 +563,42 @@ def settings_payload(user):
         'setBio':           user.get('biodescription') or A.defaultbiodescription,
         'setUniversity':    user.get('university', ''),
         'setDepartment':    user.get('department', ''),
-        'setProfilePic':    user.get('profilepicurl') or '',
+        'setProfilePic':    user.get('profilepicurl') or A.defaultavatarurl,
     }
 
 
 # ═══════════════════════════════════════════════════════════════
 # PROFILE DATA
 # ═══════════════════════════════════════════════════════════════
+def get_global_research(seen_keys=None, limit=10):
+    seen_keys = seen_keys or []
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                   pe.data as extras
+            FROM posts p
+            JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+            WHERE p.post_type = 'research'
+            AND p.post_key != ALL(%s)
+            AND p.visibility = 'public'
+            ORDER BY p.created_at DESC
+            LIMIT %s
+        """, (seen_keys, limit))
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d['time_ago'] = time_ago(d.get('created_at'))
+            result.append(d)
+        return result
+    finally:
+        release_conn(conn)
+
+
 def get_user_posts(user_key, tab, seen_keys=None):
     conn = get_conn()
     try:
@@ -582,9 +607,11 @@ def get_user_posts(user_key, tab, seen_keys=None):
 
         if tab == 'posts':
             query = """
-                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level
+                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                       pe.data as extras
                 FROM posts p
                 JOIN user_auth u ON u.user_key = p.user_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
                 WHERE p.user_key = %s
                 AND p.post_key != ALL(%s)
                 AND p.post_type NOT IN ('research')
@@ -593,9 +620,11 @@ def get_user_posts(user_key, tab, seen_keys=None):
             """
         elif tab == 'research':
             query = """
-                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level
+                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                       pe.data as extras
                 FROM posts p
                 JOIN user_auth u ON u.user_key = p.user_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
                 WHERE p.user_key = %s
                 AND p.post_key != ALL(%s)
                 AND p.post_type = 'research'
@@ -802,10 +831,12 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
 
         cur.execute(f"""
             SELECT p.*, u.full_name, u.username, u.profilepicurl,
-                   u.university, u.department, u.academic_level, u.account_level
+                   u.university, u.department, u.academic_level, u.account_level,
+                   pe.data as extras
             FROM posts p
             JOIN user_auth u ON u.user_key = p.user_key
             LEFT JOIN blocks b ON (b.blocker_key = %s AND b.blocked_key = p.user_key)
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
             WHERE p.post_key != ALL(%s)
             AND p.show_in_feed = TRUE
             AND p.visibility = 'public'
@@ -822,6 +853,9 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
 
         for post in posts:
             post['score'] = score_post(post, user, following_keys)
+            post['time_ago'] = time_ago(post.get('created_at'))
+            if post.get('extras') is None:
+                post['extras'] = {}
 
         posts.sort(key=lambda p: p['score'], reverse=True)
 
@@ -2102,6 +2136,28 @@ def Frontend_request_executor(x, token=None):
     elif status == 'delete_post':  return delete_post(x, token)
 
     # ── PROFILE ───────────────────────────────────────────────
+    elif status == 'get_profile':
+        user_key = validate_session(token)
+        if not user_key:
+            return {'status': 401, 'message': A.Unauthorizedmessage}
+        user = get_user_by_key(user_key)
+        return {
+            'status':    200,
+            'full_name': user['full_name'],
+            'username':  user['username'],
+            'bio':       user.get('biodescription', ''),
+            'avatar':    user.get('profilepicurl') or A.defaultavatarurl,
+            'following': user.get('numberoffollowing', 0),
+            'followers': user.get('numberoffollowers', 0),
+            'likes':     user.get('numberoflikes', 0),
+            'posts':     user.get('numberofposts', 0),
+        }
+
+    elif status == 'get_global_research':
+        seen_keys = x.get('seen_keys', [])
+        posts     = get_global_research(seen_keys)
+        return {'status': 200, 'posts': posts}
+
     elif status == 'get_user_posts':
         user_key = validate_session(token)
         if not user_key:
