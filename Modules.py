@@ -2155,15 +2155,18 @@ def Frontend_request_executor(x, token=None):
             return {'status': 401, 'message': A.Unauthorizedmessage}
         user = get_user_by_key(user_key)
         return {
-            'status':    200,
-            'full_name': user['full_name'],
-            'username':  user['username'],
-            'bio':       user.get('biodescription', ''),
-            'avatar':    user.get('profilepicurl') or A.defaultavatarurl,
-            'following': user.get('numberoffollowing', 0),
-            'followers': user.get('numberoffollowers', 0),
-            'likes':     user.get('numberoflikes', 0),
-            'posts':     user.get('numberofposts', 0),
+            'status':         200,
+            'full_name':      user['full_name'],
+            'username':       user['username'],
+            'bio':            user.get('biodescription') or A.defaultbiodescription,
+            'avatar':         user.get('profilepicurl') or A.defaultavatarurl,
+            'department':     user.get('department', ''),
+            'university':     user.get('university', ''),
+            'academic_level': user.get('academic_level', ''),
+            'following':      user.get('numberoffollowing', 0),
+            'followers':      user.get('numberoffollowers', 0),
+            'likes':          user.get('numberoflikes', 0),
+            'posts':          user.get('numberofposts', 0),
         }
 
     elif status == 'get_global_research':
