@@ -531,11 +531,11 @@ def profileinfo(user):
     department = user.get('department', '')
     level      = user.get('academic_level', '')
     university = user.get('university', '')
+    bio        = user.get('biodescription') or A.defaultbiodescription
     tick       = ' ✓' if user.get('account_level') == 'premium' else ''
     return f'''<div class="name">{name}{tick}</div>
-<div class="handle">{username}</div>
-<div class="bio">{department} &bull; {level} &bull; {university}</div>'''
-
+<div class="handle">@{username}</div>
+<div class="bio">{department} &bull; {level} &bull; {university} &bull; {bio}</div>'''
 def profilestats(user):
     followers = user.get('numberoffollowers', 0)
     following = user.get('numberoffollowing', 0)
