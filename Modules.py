@@ -568,7 +568,7 @@ def settings_payload(user):
 
 
 # ═══════════════════════════════════════════════════════════════
-# PROFILE DATA
+#  DATA
 # ═══════════════════════════════════════════════════════════════
 def get_global_research(seen_keys=None, limit=10):
     seen_keys = seen_keys or []
@@ -2136,6 +2136,19 @@ def Frontend_request_executor(x, token=None):
     elif status == 'delete_post':  return delete_post(x, token)
 
     # ── PROFILE ───────────────────────────────────────────────
+    elif status == 'personalize':
+        user_key = validate_session(token)
+        if not user_key:
+            return {'status': 401, 'message': A.Unauthorizedmessage}
+        user           = get_user_by_key(user_key)
+        following_data = get_following(user_key)
+        notif_count    = get_unread_notif_count(token)
+        ans            = {'status': 200}
+        ans           |= Frontend_personalizer(x, user, token)
+        ans['userListContent'] = build_user_list_html(following_data, user_key)
+        ans['notif_count']     = notif_count
+        return ans
+
     elif status == 'get_profile':
         user_key = validate_session(token)
         if not user_key:
