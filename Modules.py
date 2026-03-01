@@ -1313,6 +1313,21 @@ def get_post_owner(post_key):
 # ═══════════════════════════════════════════════════════════════
 # CREATE POST
 # ═══════════════════════════════════════════════════════════════
+def upload_to_cloudinary(data_url, resource_type='image'):
+    try:
+        import cloudinary
+        import cloudinary.uploader
+        cloudinary.config(
+            cloud_name = A.CLOUDINARY_CLOUD_NAME,
+            api_key    = A.CLOUDINARY_API_KEY,
+            api_secret = A.CLOUDINARY_API_SECRET
+        )
+        result = cloudinary.uploader.upload(data_url, resource_type=resource_type, folder='trends_posts')
+        return result.get('secure_url', '')
+    except Exception as e:
+        print(f'[Cloudinary] Upload failed: {e}')
+        return data_url
+
 def create_post(x, token):
     user_key = validate_session(token)
     if not user_key:
@@ -1321,8 +1336,16 @@ def create_post(x, token):
     post_key    = gen_key()
     post_type   = x.get('type', 'text')
     content     = x.get('content', '').strip()
-    media_url   = x.get('media', {}).get('url', '') if x.get('media') else ''
-    media_type  = x.get('media', {}).get('type', '') if x.get('media') else ''
+    media_url  = ''
+    media_type = ''
+    if x.get('media'):
+       raw_url    = x['media'].get('url', '')
+       media_type = x['media'].get('type', '')
+       if raw_url.startswith('data:'):
+          rtype     = 'video' if media_type == 'video' else 'image'
+          media_url = upload_to_cloudinary(raw_url, rtype)
+       else:
+          media_url = raw_url
     visibility  = x.get('visibility', 'public')
     allow_comments = x.get('allowComments', True)
     show_in_feed   = x.get('showInFeed', True)
