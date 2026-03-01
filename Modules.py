@@ -533,7 +533,7 @@ def profileinfo(user):
     university = user.get('university', '')
     tick       = ' ✓' if user.get('account_level') == 'premium' else ''
     return f'''<div class="name">{name}{tick}</div>
-<div class="handle">@{username}</div>
+<div class="handle">{username}</div>
 <div class="bio">{department} &bull; {level} &bull; {university}</div>'''
 
 def profilestats(user):
@@ -557,9 +557,9 @@ def get_avatar_html(user):
 def settings_payload(user):
     return {
         'setProfileName':   user['full_name'],
-        'setProfileHandle': f"@{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
+        'setProfileHandle': f"{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
         'setEmail':         user['email'],
-        'setUsername':      f"@{user['username']}",
+        'setUsername':      f"{user['username']}",
         'setBio':           user.get('biodescription') or A.defaultbiodescription,
         'setUniversity':    user.get('university', ''),
         'setDepartment':    user.get('department', ''),
@@ -700,7 +700,7 @@ def build_user_list_html(users, current_user_key):
   <img {img_style} alt="profile">
   <div class="user-item-info">
     <div class="user-item-name">{u["full_name"]}{tick}</div>
-    <div class="user-item-handle">@{u["username"]}</div>
+    <div class="user-item-handle">{u["username"]}</div>
     <div class="user-item-dept">{u.get("department","")} &bull; {u.get("university","")}</div>
   </div>
   <button class="user-follow-btn" onclick="toggleFollow('{u["user_key"]}',this)">Follow</button>
@@ -1471,8 +1471,8 @@ def update_username(x, token):
         cur.close()
         user = get_user_by_key(user_key)
         return {'status': 200, 'message': A.Usernameupdatesuccessmessage,
-                'setUsername': f'@{new_username}',
-                'setProfileHandle': f"@{new_username} &bull; {user.get('department','')} &bull; {user.get('university','')}"}
+                'setUsername': f'{new_username}',
+                'setProfileHandle': f"{new_username} &bull; {user.get('department','')} &bull; {user.get('university','')}"}
     except Exception as e:
         conn.rollback()
         raise
@@ -1538,7 +1538,7 @@ def update_profile_info(x, token):
         user = get_user_by_key(user_key)
         return {'status': 200, 'message': A.Profileupdatesuccessmessage,
                 'setProfileName': user['full_name'],
-                'setProfileHandle': f"@{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
+                'setProfileHandle': f"{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
                 'info': profileinfo(user)}
     except Exception as e:
         conn.rollback()
