@@ -165,7 +165,7 @@ def create_table():
                 user_key       VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 post_type      VARCHAR(20) NOT NULL,
                 content        TEXT DEFAULT '',
-                media_url      TEXT DEFAULT '',
+                      TEXT DEFAULT '',
                 media_type     VARCHAR(20) DEFAULT '',
                 visibility     VARCHAR(20) DEFAULT 'public',
                 allow_comments BOOLEAN DEFAULT TRUE,
@@ -296,7 +296,7 @@ def create_table():
                 convo_key    VARCHAR(64) NOT NULL REFERENCES conversations(convo_key) ON DELETE CASCADE,
                 sender_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 content      TEXT DEFAULT '',
-                media_url    TEXT DEFAULT '',
+                    TEXT DEFAULT '',
                 is_read      BOOLEAN DEFAULT FALSE,
                 reply_to_key VARCHAR(64) DEFAULT '',
                 sent_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -328,7 +328,7 @@ def create_table():
                 ad_key     VARCHAR(64) UNIQUE NOT NULL,
                 user_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 title      TEXT NOT NULL,
-                media_url  TEXT DEFAULT '',
+                  TEXT DEFAULT '',
                 body_text  TEXT DEFAULT '',
                 cta        TEXT DEFAULT '',
                 link       TEXT DEFAULT '',
@@ -1333,20 +1333,12 @@ def create_post(x, token):
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
 
-    post_key    = gen_key()
-    post_type   = x.get('type', 'text')
-    content     = x.get('content', '').strip()
-    media_url  = ''
-    media_type = ''
-    if x.get('media'):
-       raw_url    = x['media'].get('url', '')
-       media_type = x['media'].get('type', '')
-       if raw_url.startswith('data:'):
-          rtype     = 'video' if media_type == 'video' else 'image'
-          media_url = upload_to_cloudinary(raw_url, rtype)
-       else:
-          media_url = raw_url
-    visibility  = x.get('visibility', 'public')
+    post_key       = gen_key()
+    post_type      = x.get('type', 'text')
+    content        = x.get('content', '').strip()
+    media_url      = x.get('media', {}).get('url', '') if x.get('media') else ''
+    media_type     = x.get('media', {}).get('type', '') if x.get('media') else ''
+    visibility     = x.get('visibility', 'public')
     allow_comments = x.get('allowComments', True)
     show_in_feed   = x.get('showInFeed', True)
 
@@ -1394,7 +1386,6 @@ def create_post(x, token):
         raise
     finally:
         release_conn(conn)
-
 def delete_post(x, token):
     user_key = validate_session(token)
     if not user_key:
@@ -1940,9 +1931,9 @@ def send_dm(x, token):
         return {'status': 401, 'message': A.Unauthorizedmessage}
     recipient_key = x.get('recipient_key')
     content       = x.get('content', '').strip()
-    media_url     = x.get('media_url', '')
+         = x.get('', '')
     reply_to_key  = x.get('reply_to_key', '')
-    if not content and not media_url:
+    if not content and not :
         return {'status': 400, 'message': 'Message cannot be empty.'}
     convo_key = get_or_create_conversation(user_key, recipient_key)
     conn = get_conn()
@@ -1950,9 +1941,9 @@ def send_dm(x, token):
         cur     = conn.cursor()
         msg_key = gen_key()
         cur.execute("""
-            INSERT INTO messages (msg_key, convo_key, sender_key, content, media_url, reply_to_key)
+            INSERT INTO messages (msg_key, convo_key, sender_key, content, , reply_to_key)
             VALUES (%s,%s,%s,%s,%s,%s)
-        """, (msg_key, convo_key, user_key, content, media_url, reply_to_key))
+        """, (msg_key, convo_key, user_key, content, , reply_to_key))
         push_notification(
             recipient_key=recipient_key,
             sender_key=user_key,
