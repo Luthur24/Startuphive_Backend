@@ -23,9 +23,12 @@ else:
     DB_PORT     = 5432
 
 # ── CLOUDINARY ──────────────────────────────────────────────────
-CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', 'your_cloud_name_here')
-CLOUDINARY_API_KEY    = os.environ.get('CLOUDINARY_API_KEY',    'your_api_key_here')
-CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', 'your_api_secret_here')
+#CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', 'your_cloud_name_here')
+CLOUDINARY_CLOUD_NAME = 'ddusfl7pi'
+#CLOUDINARY_API_KEY    = os.environ.get('CLOUDINARY_API_KEY',    'your_api_key_here')
+CLOUDINARY_API_KEY    = '599965682593626'
+#CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', 'your_api_secret_here')
+CLOUDINARY_API_SECRET = 'pUcb90_1jtv-rDlHXRRsfDcBK5k'
 
 # ── SESSION ─────────────────────────────────────────────────────
 SECRET_KEY            = os.environ.get('SECRET_KEY', 'treands_secret_key_change_in_production')
