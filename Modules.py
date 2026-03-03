@@ -296,7 +296,7 @@ def create_table():
                 convo_key    VARCHAR(64) NOT NULL REFERENCES conversations(convo_key) ON DELETE CASCADE,
                 sender_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 content      TEXT DEFAULT '',
-                    TEXT DEFAULT '',
+                media_url    TEXT DEFAULT '',
                 is_read      BOOLEAN DEFAULT FALSE,
                 reply_to_key VARCHAR(64) DEFAULT '',
                 sent_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -328,7 +328,7 @@ def create_table():
                 ad_key     VARCHAR(64) UNIQUE NOT NULL,
                 user_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 title      TEXT NOT NULL,
-                  TEXT DEFAULT '',
+                media_url  TEXT DEFAULT '',
                 body_text  TEXT DEFAULT '',
                 cta        TEXT DEFAULT '',
                 link       TEXT DEFAULT '',
