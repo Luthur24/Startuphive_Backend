@@ -1931,9 +1931,9 @@ def send_dm(x, token):
         return {'status': 401, 'message': A.Unauthorizedmessage}
     recipient_key = x.get('recipient_key')
     content       = x.get('content', '').strip()
-         = x.get('', '')
+    media_url     = x.get('media_url', '')
     reply_to_key  = x.get('reply_to_key', '')
-    if not content and not :
+    if not content and not media_url:
         return {'status': 400, 'message': 'Message cannot be empty.'}
     convo_key = get_or_create_conversation(user_key, recipient_key)
     conn = get_conn()
@@ -1941,9 +1941,9 @@ def send_dm(x, token):
         cur     = conn.cursor()
         msg_key = gen_key()
         cur.execute("""
-            INSERT INTO messages (msg_key, convo_key, sender_key, content, , reply_to_key)
+            INSERT INTO messages (msg_key, convo_key, sender_key, content, media_url, reply_to_key)
             VALUES (%s,%s,%s,%s,%s,%s)
-        """, (msg_key, convo_key, user_key, content, , reply_to_key))
+        """, (msg_key, convo_key, user_key, content, media_url, reply_to_key))
         push_notification(
             recipient_key=recipient_key,
             sender_key=user_key,
