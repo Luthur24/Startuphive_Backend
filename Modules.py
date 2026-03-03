@@ -165,7 +165,7 @@ def create_table():
                 user_key       VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
                 post_type      VARCHAR(20) NOT NULL,
                 content        TEXT DEFAULT '',
-                      TEXT DEFAULT '',
+                media_url      TEXT DEFAULT '',
                 media_type     VARCHAR(20) DEFAULT '',
                 visibility     VARCHAR(20) DEFAULT 'public',
                 allow_comments BOOLEAN DEFAULT TRUE,
