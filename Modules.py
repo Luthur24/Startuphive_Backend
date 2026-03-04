@@ -605,10 +605,16 @@ def get_user_posts(user_key, tab, seen_keys=None):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         seen_keys = seen_keys or []
 
+        base_select = """
+            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                   pe.data as extras,
+                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
+                   EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key = p.post_key AND bk.user_key = %s) as is_bookmarked,
+                   EXTRACT(EPOCH FROM (NOW() - p.created_at))::int as age_seconds
+        """
+
         if tab == 'posts':
-            query = """
-                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
-                       pe.data as extras
+            query = base_select + """
                 FROM posts p
                 JOIN user_auth u ON u.user_key = p.user_key
                 LEFT JOIN post_extras pe ON pe.post_key = p.post_key
@@ -618,10 +624,9 @@ def get_user_posts(user_key, tab, seen_keys=None):
                 ORDER BY p.created_at DESC
                 LIMIT %s
             """
+            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         elif tab == 'research':
-            query = """
-                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
-                       pe.data as extras
+            query = base_select + """
                 FROM posts p
                 JOIN user_auth u ON u.user_key = p.user_key
                 LEFT JOIN post_extras pe ON pe.post_key = p.post_key
@@ -631,24 +636,72 @@ def get_user_posts(user_key, tab, seen_keys=None):
                 ORDER BY p.created_at DESC
                 LIMIT %s
             """
+            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         elif tab == 'saved':
-            query = """
-                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level
+            query = base_select + """
                 FROM posts p
                 JOIN user_auth u ON u.user_key = p.user_key
                 JOIN bookmarks b ON b.post_key = p.post_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
                 WHERE b.user_key = %s
                 AND p.post_key != ALL(%s)
                 ORDER BY b.saved_at DESC
                 LIMIT %s
             """
+            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         else:
             return []
 
-        cur.execute(query, (user_key, seen_keys, A.FEED_SCROLL_COUNT))
         posts = cur.fetchall()
         cur.close()
-        return [dict(p) for p in posts]
+
+        result = []
+        for p in posts:
+            post = dict(p)
+            # Format time_ago
+            age = post.pop('age_seconds', 0) or 0
+            if age < 60:
+                post['time_ago'] = 'just now'
+            elif age < 3600:
+                post['time_ago'] = f"{age // 60}m ago"
+            elif age < 86400:
+                post['time_ago'] = f"{age // 3600}h ago"
+            elif age < 604800:
+                post['time_ago'] = f"{age // 86400}d ago"
+            else:
+                post['time_ago'] = f"{age // 604800}w ago"
+            result.append(post)
+        return result
+    finally:
+        release_conn(conn)
+
+def get_post(post_key, user_key):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                   pe.data as extras,
+                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
+                   EXISTS(SELECT 1 FROM bookmarks b WHERE b.post_key = p.post_key AND b.user_key = %s) as is_bookmarked,
+                   EXTRACT(EPOCH FROM (NOW() - p.created_at))::int as age_seconds
+            FROM posts p
+            JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+            WHERE p.post_key = %s
+        """, (user_key, user_key, post_key))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        post = dict(row)
+        age = post.pop('age_seconds', 0) or 0
+        if age < 60:    post['time_ago'] = 'just now'
+        elif age < 3600:  post['time_ago'] = f"{age // 60}m ago"
+        elif age < 86400: post['time_ago'] = f"{age // 3600}h ago"
+        elif age < 604800:post['time_ago'] = f"{age // 86400}d ago"
+        else:             post['time_ago'] = f"{age // 604800}w ago"
+        return post
     finally:
         release_conn(conn)
 
@@ -1353,6 +1406,8 @@ def create_post(x, token):
         """, (post_key, user_key, post_type, content, media_url, media_type,
               visibility, allow_comments, show_in_feed))
 
+        hashtags = x.get('hashtags', [])
+
         extras = {}
         if post_type == 'poll':
             extras = {'poll_options': [{'text': o, 'votes': 0} for o in x.get('pollOptions', [])],
@@ -1369,8 +1424,13 @@ def create_post(x, token):
             extras = x.get('product', {})
         elif post_type == 'collab':
             extras = x.get('collab', {})
+        elif post_type == 'question':
+            extras = x.get('question', {})
         elif post_type == 'ad':
             extras = x.get('ad', {})
+
+        if hashtags:
+            extras['hashtags'] = hashtags
 
         if extras:
             cur.execute("INSERT INTO post_extras (post_key, data) VALUES (%s,%s)",
@@ -2188,6 +2248,12 @@ def Frontend_request_executor(x, token=None):
         posts     = get_global_research(seen_keys)
         return {'status': 200, 'posts': posts}
 
+    elif status == 'get_post':
+        user_key = validate_session(token)
+        if not user_key: return {'status': 401, 'message': A.Unauthorizedmessage}
+        post = get_post(x.get('post_key'), user_key)
+        if not post: return {'status': 404, 'message': 'Post not found.'}
+        return {'status': 200, 'post': post}
     elif status == 'get_user_posts':
         user_key = validate_session(token)
         if not user_key:
