@@ -610,6 +610,7 @@ def get_user_posts(user_key, tab, seen_keys=None):
                    pe.data as extras,
                    EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
                    EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key = p.post_key AND bk.user_key = %s) as is_bookmarked,
+       EXISTS(SELECT 1 FROM follows f WHERE f.follower_key = %s AND f.following_key = p.user_key) as is_following,
                    EXTRACT(EPOCH FROM (NOW() - p.created_at))::int as age_seconds
         """
 
@@ -702,6 +703,41 @@ def get_post(post_key, user_key):
         elif age < 604800:post['time_ago'] = f"{age // 86400}d ago"
         else:             post['time_ago'] = f"{age // 604800}w ago"
         return post
+    finally:
+        release_conn(conn)
+
+def get_announcements(limit=20):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT a.*, u.full_name, u.profilepicurl
+            FROM announcements a
+            LEFT JOIN user_auth u ON u.user_key = a.author_key
+            WHERE a.is_active = TRUE
+            ORDER BY a.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for r in rows:
+            ann = dict(r)
+            ann['time_ago'] = time_ago(ann.get('created_at'))
+            result.append(ann)
+        # If no announcements yet, return platform defaults
+        if not result:
+            result = [{
+                'ann_key': 'default-1',
+                'title': 'Welcome to Trends!',
+                'body': 'Connect with researchers, students and academics across Nigerian universities. Share your work, collaborate and grow.',
+                'ann_type': 'update',
+                'priority': 'normal',
+                'time_ago': 'just now',
+                'views': 0,
+                'full_name': 'Trends Team'
+            }]
+        return result
     finally:
         release_conn(conn)
 
@@ -877,15 +913,22 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
         # Build type filter clause
         if type_filter and type_filter != 'all':
             type_clause = "AND p.post_type = %s"
-            params = (user_key, seen_keys, type_filter, n * 3)
         else:
             type_clause = ""
-            params = (user_key, seen_keys, n * 3)
+            type_filter = None
+
+        if type_filter:
+            params = (user_key, user_key, user_key, seen_keys, type_filter, n * 3)
+        else:
+            params = (user_key, user_key, user_key, seen_keys, n * 3)
 
         cur.execute(f"""
             SELECT p.*, u.full_name, u.username, u.profilepicurl,
                    u.university, u.department, u.academic_level, u.account_level,
-                   pe.data as extras
+                   pe.data as extras,
+                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
+                   EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key = p.post_key AND bk.user_key = %s) as is_bookmarked,
+       EXISTS(SELECT 1 FROM follows f WHERE f.follower_key = %s AND f.following_key = p.user_key) as is_following
             FROM posts p
             JOIN user_auth u ON u.user_key = p.user_key
             LEFT JOIN blocks b ON (b.blocker_key = %s AND b.blocked_key = p.user_key)
@@ -1601,12 +1644,17 @@ def update_profile_info(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE user_auth SET
-              full_name=%s, university=%s, department=%s, academic_level=%s
-            WHERE user_key=%s
-        """, (x.get('full_name',''), x.get('university',''),
-              x.get('department',''), x.get('academic_level',''), user_key))
+        # Build dynamic update - only update fields that were sent
+        fields = []
+        vals = []
+        for col in ['full_name', 'university', 'department', 'academic_level', 'bio']:
+            if col in x and x[col] is not None:
+                fields.append(f"{col}=%s")
+                vals.append(x[col])
+        if not fields:
+            return {'status': 400, 'message': 'Nothing to update.'}
+        vals.append(user_key)
+        cur.execute(f"UPDATE user_auth SET {', '.join(fields)} WHERE user_key=%s", vals)
         conn.commit()
         cur.close()
         user = get_user_by_key(user_key)
@@ -1852,7 +1900,21 @@ def get_notifications(token):
         """, (user_key,))
         rows = cur.fetchall()
         cur.close()
-        return {'status': 200, 'notifications': [dict(r) for r in rows]}
+        result = []
+        for r in rows:
+            n = dict(r)
+            ts = n.get('created_at')
+            if ts:
+                import datetime
+                now = datetime.datetime.now(ts.tzinfo)
+                age = int((now - ts).total_seconds())
+                if age < 60:      n['time_ago'] = 'just now'
+                elif age < 3600:  n['time_ago'] = f"{age // 60}m ago"
+                elif age < 86400: n['time_ago'] = f"{age // 3600}h ago"
+                elif age < 604800:n['time_ago'] = f"{age // 86400}d ago"
+                else:             n['time_ago'] = f"{age // 604800}w ago"
+            result.append(n)
+        return {'status': 200, 'notifications': result}
     finally:
         release_conn(conn)
 
@@ -1948,16 +2010,16 @@ def get_or_create_conversation(user_key, other_key):
         row = cur.fetchone()
         if row:
             cur.close()
-            return row['convo_key']
+            return {'status': 200, 'convo_key': row['convo_key']}
         convo_key = gen_key()
         cur.execute("INSERT INTO conversations (convo_key, user_a_key, user_b_key) VALUES (%s,%s,%s)",
                     (convo_key, user_key, other_key))
         conn.commit()
         cur.close()
-        return convo_key
+        return {'status': 200, 'convo_key': convo_key}
     except Exception as e:
         conn.rollback()
-        raise
+        return {'status': 500, 'message': 'Could not create conversation.'}
     finally:
         release_conn(conn)
 
@@ -1995,7 +2057,8 @@ def send_dm(x, token):
     reply_to_key  = x.get('reply_to_key', '')
     if not content and not media_url:
         return {'status': 400, 'message': 'Message cannot be empty.'}
-    convo_key = get_or_create_conversation(user_key, recipient_key)
+    convo_res = get_or_create_conversation(user_key, recipient_key)
+        convo_key = convo_res.get('convo_key') if isinstance(convo_res, dict) else convo_res
     conn = get_conn()
     try:
         cur     = conn.cursor()
@@ -2034,7 +2097,20 @@ def get_global_messages():
         """)
         rows = cur.fetchall()
         cur.close()
-        return {'status': 200, 'messages': [dict(r) for r in reversed(rows)]}
+        result = []
+        for r in reversed(rows):
+            m = dict(r)
+            ts = m.get('sent_at')
+            if ts:
+                import datetime
+                now = datetime.datetime.now(ts.tzinfo)
+                age = int((now - ts).total_seconds())
+                if age < 60:      m['time_ago'] = 'just now'
+                elif age < 3600:  m['time_ago'] = f"{age // 60}m ago"
+                elif age < 86400: m['time_ago'] = f"{age // 3600}h ago"
+                else:             m['time_ago'] = f"{age // 86400}d ago"
+            result.append(m)
+        return {'status': 200, 'messages': result}
     finally:
         release_conn(conn)
 
@@ -2248,6 +2324,16 @@ def Frontend_request_executor(x, token=None):
         posts     = get_global_research(seen_keys)
         return {'status': 200, 'posts': posts}
 
+    elif status == 'get_or_create_conversation':
+        other_key = x.get('other_key')
+        user_key_val = validate_session(token)
+        if not user_key_val:
+            return {'status': 401, 'message': A.Unauthorizedmessage}
+        res = get_or_create_conversation(user_key_val, other_key)
+        return res
+    elif status == 'get_announcements':
+        anns = get_announcements()
+        return {'status': 200, 'announcements': anns}
     elif status == 'get_post':
         user_key = validate_session(token)
         if not user_key: return {'status': 401, 'message': A.Unauthorizedmessage}
