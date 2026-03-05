@@ -2057,7 +2057,7 @@ def send_dm(x, token):
     reply_to_key  = x.get('reply_to_key', '')
     if not content and not media_url:
         return {'status': 400, 'message': 'Message cannot be empty.'}
-    convo_res = get_or_create_conversation(user_key, recipient_key)
+        convo_res = get_or_create_conversation(user_key, recipient_key)
         convo_key = convo_res.get('convo_key') if isinstance(convo_res, dict) else convo_res
     conn = get_conn()
     try:
