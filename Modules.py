@@ -625,7 +625,7 @@ def get_user_posts(user_key, tab, seen_keys=None):
                 ORDER BY p.created_at DESC
                 LIMIT %s
             """
-            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
+            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         elif tab == 'research':
             query = base_select + """
                 FROM posts p
@@ -637,7 +637,7 @@ def get_user_posts(user_key, tab, seen_keys=None):
                 ORDER BY p.created_at DESC
                 LIMIT %s
             """
-            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
+            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         elif tab == 'saved':
             query = base_select + """
                 FROM posts p
@@ -649,7 +649,7 @@ def get_user_posts(user_key, tab, seen_keys=None):
                 ORDER BY b.saved_at DESC
                 LIMIT %s
             """
-            cur.execute(query, (user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
+            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
         else:
             return []
 
@@ -918,9 +918,9 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
             type_filter = None
 
         if type_filter:
-            params = (user_key, user_key, user_key, seen_keys, type_filter, n * 3)
+            params = (user_key, user_key, user_key, user_key, seen_keys, type_filter, n * 3)
         else:
-            params = (user_key, user_key, user_key, seen_keys, n * 3)
+            params = (user_key, user_key, user_key, user_key, seen_keys, n * 3)
 
         cur.execute(f"""
             SELECT p.*, u.full_name, u.username, u.profilepicurl,
@@ -1661,7 +1661,9 @@ def update_profile_info(x, token):
         return {'status': 200, 'message': A.Profileupdatesuccessmessage,
                 'setProfileName': user['full_name'],
                 'setProfileHandle': f"{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
-                'info': profileinfo(user)}
+                'department': user.get('department',''),
+            'university':  user.get('university',''),
+            'info': profileinfo(user)}
     except Exception as e:
         conn.rollback()
         raise
@@ -1801,7 +1803,15 @@ def search(x, token):
             ORDER BY p.like_count DESC
             LIMIT 20
         """, (pattern,))
-        post_results = [dict(r) for r in cur.fetchall()]
+        post_results = []
+        for r in cur.fetchall():
+            p = dict(r)
+            p['time_ago'] = time_ago(p.get('created_at'))
+            p['extras'] = {}
+            p['is_liked'] = False
+            p['is_bookmarked'] = False
+            p['is_following'] = False
+            post_results.append(p)
 
         cur.execute("""
             SELECT user_key, full_name, username, profilepicurl,
@@ -1812,6 +1822,11 @@ def search(x, token):
             LIMIT 10
         """, (pattern, pattern))
         user_results = [dict(r) for r in cur.fetchall()]
+        # Check follow status for each user
+        if user_key:
+            for u in user_results:
+                cur.execute("SELECT 1 FROM follows WHERE follower_key=%s AND following_key=%s", (user_key, u['user_key']))
+                u['is_following'] = bool(cur.fetchone())
 
         cur.close()
         return {
@@ -2057,8 +2072,8 @@ def send_dm(x, token):
     reply_to_key  = x.get('reply_to_key', '')
     if not content and not media_url:
         return {'status': 400, 'message': 'Message cannot be empty.'}
-        convo_res = get_or_create_conversation(user_key, recipient_key)
-        convo_key = convo_res.get('convo_key') if isinstance(convo_res, dict) else convo_res
+    convo_res = get_or_create_conversation(user_key, recipient_key)
+    convo_key = convo_res.get('convo_key') if isinstance(convo_res, dict) else convo_res
     conn = get_conn()
     try:
         cur     = conn.cursor()
@@ -2144,6 +2159,9 @@ def send_global_message(x, token):
 # ═══════════════════════════════════════════════════════════════
 def Frontend_personalizer(x, user, token=None):
     ans = {}
+    ans['user_key']    = user['user_key']
+    ans['department']  = user.get('department', '')
+    ans['university']  = user.get('university', '')
 
     # ── Profile page ──────────────────────────────────────────
     ans['profilenav'] = drawerprofilenav(user)
