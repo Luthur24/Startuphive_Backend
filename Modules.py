@@ -1,841 +1,3 @@
-# ═══════════════════════════════════════════════════════════════
-# MODULES.PY — Treℵds Platform Backend Logic
-# ═══════════════════════════════════════════════════════════════
-
-import psycopg2
-import psycopg2.pool
-import bcrypt
-import uuid
-import json
-import secrets
-from datetime import datetime, timedelta
-from psycopg2.extras import RealDictCursor
-import Appmodulator as A
-
-# ═══════════════════════════════════════════════════════════════
-# CONNECTION POOL
-# ═══════════════════════════════════════════════════════════════
-_pool = None
-
-def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2, maxconn=20,
-            host=A.DB_HOST, database=A.DB_NAME,
-            user=A.DB_USER, password=A.DB_PASSWORD, port=A.DB_PORT
-        )
-    return _pool
-
-def get_conn():
-    return get_pool().getconn()
-
-def release_conn(conn):
-    get_pool().putconn(conn)
-
-# ═══════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════
-def gen_key():
-    return str(uuid.uuid4()).replace("-", "")
-
-def gen_token():
-    return secrets.token_urlsafe(48)
-
-def hash_password(pw):
-    return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def check_password(pw, hashed):
-    return bcrypt.checkpw(pw.encode('utf-8'), hashed.encode('utf-8'))
-
-def time_ago(timestamp):
-    if not timestamp:
-        return ""
-    now  = datetime.utcnow()
-    diff = now - timestamp
-    s    = int(diff.total_seconds())
-    if s < 60:       return "Just now"
-    if s < 3600:     return f"{s // 60}m ago"
-    if s < 86400:    return f"{s // 3600}h ago"
-    if s < 604800:   return f"{s // 86400}d ago"
-    return timestamp.strftime("%b %d, %Y")
-
-def get_user_by_key(user_key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM user_auth WHERE user_key = %s", (user_key,))
-        return cur.fetchone()
-    finally:
-        release_conn(conn)
-
-def get_user_by_email(email):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM user_auth WHERE email = %s", (email,))
-        return cur.fetchone()
-    finally:
-        release_conn(conn)
-
-def get_user_from_token(token):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT u.* FROM user_auth u
-            JOIN sessions s ON s.user_key = u.user_key
-            WHERE s.token = %s AND s.expires_at > NOW()
-        """, (token,))
-        return cur.fetchone()
-    finally:
-        release_conn(conn)
-
-
-# ═══════════════════════════════════════════════════════════════
-# CREATE TABLES
-# ═══════════════════════════════════════════════════════════════
-def create_table():
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-
-            -- USER AUTH
-            CREATE TABLE IF NOT EXISTS user_auth (
-                id                        SERIAL PRIMARY KEY,
-                user_key                  VARCHAR(64) UNIQUE NOT NULL,
-                full_name                 VARCHAR(100) NOT NULL,
-                username                  VARCHAR(50) UNIQUE NOT NULL,
-                email                     VARCHAR(255) UNIQUE NOT NULL,
-                password                  VARCHAR(255) NOT NULL,
-                university                VARCHAR(200) DEFAULT '',
-                department                VARCHAR(200) DEFAULT '',
-                academic_level            VARCHAR(100) DEFAULT '',
-                created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                profilepicurl             TEXT DEFAULT '',
-                biodescription            TEXT DEFAULT '',
-                account_level             VARCHAR(20) DEFAULT 'normal',
-                numberoffollowers         INTEGER DEFAULT 0,
-                numberoffollowing         INTEGER DEFAULT 0,
-                numberoflikes             INTEGER DEFAULT 0,
-                numberofposts             INTEGER DEFAULT 0,
-                is_private                BOOLEAN DEFAULT FALSE,
-                show_activity_status      BOOLEAN DEFAULT TRUE,
-                post_visibility           VARCHAR(20) DEFAULT 'public',
-                research_visibility       VARCHAR(20) DEFAULT 'public',
-                message_privacy           VARCHAR(20) DEFAULT 'everyone',
-                tag_privacy               VARCHAR(20) DEFAULT 'everyone',
-                followers_list_visibility VARCHAR(20) DEFAULT 'everyone',
-                read_receipts             BOOLEAN DEFAULT TRUE,
-                typing_indicators         BOOLEAN DEFAULT TRUE,
-                message_requests_filter   VARCHAR(20) DEFAULT 'everyone',
-                notif_likes               BOOLEAN DEFAULT TRUE,
-                notif_comments            BOOLEAN DEFAULT TRUE,
-                notif_follows             BOOLEAN DEFAULT TRUE,
-                notif_mentions            BOOLEAN DEFAULT TRUE,
-                notif_messages            BOOLEAN DEFAULT TRUE,
-                notif_events              BOOLEAN DEFAULT TRUE,
-                notif_bounties            BOOLEAN DEFAULT TRUE,
-                notif_email               BOOLEAN DEFAULT TRUE,
-                notif_push                BOOLEAN DEFAULT TRUE,
-                theme                     VARCHAR(10) DEFAULT 'dark',
-                font_size                 VARCHAR(10) DEFAULT 'medium',
-                compact_mode              BOOLEAN DEFAULT FALSE,
-                two_factor_enabled        BOOLEAN DEFAULT FALSE,
-                last_password_change      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_deactivated            BOOLEAN DEFAULT FALSE,
-                last_seen                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- SESSIONS
-            CREATE TABLE IF NOT EXISTS sessions (
-                id         SERIAL PRIMARY KEY,
-                session_key VARCHAR(64) UNIQUE NOT NULL,
-                user_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                token      VARCHAR(255) UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP NOT NULL
-            );
-
-            -- POSTS
-            CREATE TABLE IF NOT EXISTS posts (
-                id             SERIAL PRIMARY KEY,
-                post_key       VARCHAR(64) UNIQUE NOT NULL,
-                user_key       VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                post_type      VARCHAR(20) NOT NULL,
-                content        TEXT DEFAULT '',
-                media_url      TEXT DEFAULT '',
-                media_type     VARCHAR(20) DEFAULT '',
-                visibility     VARCHAR(20) DEFAULT 'public',
-                allow_comments BOOLEAN DEFAULT TRUE,
-                show_in_feed   BOOLEAN DEFAULT TRUE,
-                like_count     INTEGER DEFAULT 0,
-                comment_count  INTEGER DEFAULT 0,
-                share_count    INTEGER DEFAULT 0,
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- POST EXTRAS (poll, event, bounty, research, job, product, collab, ad)
-            CREATE TABLE IF NOT EXISTS post_extras (
-                id       SERIAL PRIMARY KEY,
-                post_key VARCHAR(64) UNIQUE NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                data     JSONB NOT NULL DEFAULT '{}'
-            );
-
-            -- POLL VOTES
-            CREATE TABLE IF NOT EXISTS poll_votes (
-                id           SERIAL PRIMARY KEY,
-                vote_key     VARCHAR(64) UNIQUE NOT NULL,
-                post_key     VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key     VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                option_index INTEGER NOT NULL,
-                voted_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(post_key, user_key)
-            );
-
-            -- EVENT RSVPS
-            CREATE TABLE IF NOT EXISTS event_rsvps (
-                id          SERIAL PRIMARY KEY,
-                rsvp_key    VARCHAR(64) UNIQUE NOT NULL,
-                post_key    VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key    VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                rsvp_status VARCHAR(20) NOT NULL,
-                rsvp_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(post_key, user_key)
-            );
-
-            -- BOUNTY APPLICATIONS
-            CREATE TABLE IF NOT EXISTS bounty_applications (
-                id       SERIAL PRIMARY KEY,
-                app_key  VARCHAR(64) UNIQUE NOT NULL,
-                post_key VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                message  TEXT DEFAULT '',
-                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(post_key, user_key)
-            );
-
-            -- LIKES
-            CREATE TABLE IF NOT EXISTS likes (
-                id       SERIAL PRIMARY KEY,
-                like_key VARCHAR(64) UNIQUE NOT NULL,
-                post_key VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                liked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(post_key, user_key)
-            );
-
-            -- COMMENTS
-            CREATE TABLE IF NOT EXISTS comments (
-                id           SERIAL PRIMARY KEY,
-                comment_key  VARCHAR(64) UNIQUE NOT NULL,
-                post_key     VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key     VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                content      TEXT NOT NULL,
-                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- BOOKMARKS
-            CREATE TABLE IF NOT EXISTS bookmarks (
-                id           SERIAL PRIMARY KEY,
-                bookmark_key VARCHAR(64) UNIQUE NOT NULL,
-                post_key     VARCHAR(64) NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
-                user_key     VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                saved_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(post_key, user_key)
-            );
-
-            -- FOLLOWS
-            CREATE TABLE IF NOT EXISTS follows (
-                id            SERIAL PRIMARY KEY,
-                follow_key    VARCHAR(64) UNIQUE NOT NULL,
-                follower_key  VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                following_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                followed_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(follower_key, following_key)
-            );
-
-            -- BLOCKS
-            CREATE TABLE IF NOT EXISTS blocks (
-                id           SERIAL PRIMARY KEY,
-                block_key    VARCHAR(64) UNIQUE NOT NULL,
-                blocker_key  VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                blocked_key  VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                blocked_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(blocker_key, blocked_key)
-            );
-
-            -- NOTIFICATIONS
-            CREATE TABLE IF NOT EXISTS notifications (
-                id             SERIAL PRIMARY KEY,
-                notif_key      VARCHAR(64) UNIQUE NOT NULL,
-                recipient_key  VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                sender_key     VARCHAR(64) REFERENCES user_auth(user_key) ON DELETE SET NULL,
-                notif_type     VARCHAR(30) NOT NULL,
-                post_key       VARCHAR(64) DEFAULT '',
-                message        TEXT DEFAULT '',
-                is_read        BOOLEAN DEFAULT FALSE,
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- CONVERSATIONS
-            CREATE TABLE IF NOT EXISTS conversations (
-                id         SERIAL PRIMARY KEY,
-                convo_key  VARCHAR(64) UNIQUE NOT NULL,
-                user_a_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                user_b_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_a_key, user_b_key)
-            );
-
-            -- MESSAGES
-            CREATE TABLE IF NOT EXISTS messages (
-                id           SERIAL PRIMARY KEY,
-                msg_key      VARCHAR(64) UNIQUE NOT NULL,
-                convo_key    VARCHAR(64) NOT NULL REFERENCES conversations(convo_key) ON DELETE CASCADE,
-                sender_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                content      TEXT DEFAULT '',
-                media_url    TEXT DEFAULT '',
-                is_read      BOOLEAN DEFAULT FALSE,
-                reply_to_key VARCHAR(64) DEFAULT '',
-                sent_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- GLOBAL CHAT
-            CREATE TABLE IF NOT EXISTS global_chat (
-                id       SERIAL PRIMARY KEY,
-                msg_key  VARCHAR(64) UNIQUE NOT NULL,
-                user_key VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                content  TEXT NOT NULL,
-                sent_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- SEARCH PAIRS (for clustering algorithm)
-            CREATE TABLE IF NOT EXISTS search_pairs (
-                id            SERIAL PRIMARY KEY,
-                pair_key      VARCHAR(64) UNIQUE NOT NULL,
-                query         TEXT NOT NULL,
-                selected      TEXT NOT NULL,
-                weight        FLOAT DEFAULT 1.0,
-                last_searched TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(query, selected)
-            );
-
-            -- ADS
-            CREATE TABLE IF NOT EXISTS ads (
-                id         SERIAL PRIMARY KEY,
-                ad_key     VARCHAR(64) UNIQUE NOT NULL,
-                user_key   VARCHAR(64) NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
-                title      TEXT NOT NULL,
-                media_url  TEXT DEFAULT '',
-                body_text  TEXT DEFAULT '',
-                cta        TEXT DEFAULT '',
-                link       TEXT DEFAULT '',
-                active     BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-        """)
-        conn.commit()
-        cur.close()
-        print("[TrendsDB] All tables created/verified ✓")
-    except Exception as e:
-        conn.rollback()
-        print(f"[TrendsDB] Error: {e}")
-        raise
-    finally:
-        release_conn(conn)
-
-
-# ═══════════════════════════════════════════════════════════════
-# AUTH
-# ═══════════════════════════════════════════════════════════════
-def verify_signup_data(x):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        email    = x['email'].strip().lower()
-        username = x['username'].strip().lower()
-        cur.execute("SELECT 1 FROM user_auth WHERE email = %s",    (email,))
-        email_exists = cur.fetchone()
-        cur.execute("SELECT 1 FROM user_auth WHERE username = %s", (username,))
-        username_exists = cur.fetchone()
-        cur.close()
-        if email_exists and username_exists:
-            return {'status': 400, 'error': 'both'}
-        if email_exists:
-            return {'status': 400, 'error': 'email'}
-        if username_exists:
-            return {'status': 400, 'error': 'username'}
-        return {'status': 200}
-    finally:
-        release_conn(conn)
-
-def insert_user(x):
-    conn = get_conn()
-    try:
-        cur      = conn.cursor()
-        user_key = gen_key()
-        hashed   = hash_password(x['password'])
-        cur.execute("""
-            INSERT INTO user_auth
-              (user_key, full_name, username, email, password,
-               university, department, academic_level, biodescription)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            user_key,
-            x['full_name'].strip(),
-            x['username'].strip().lower(),
-            x['email'].strip().lower(),
-            hashed,
-            x.get('university', ''),
-            x.get('department', ''),
-            x.get('academic_level', ''),
-            A.defaultbiodescription
-        ))
-        conn.commit()
-        cur.close()
-        return user_key
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-def verify_signin_data(x):
-    user = get_user_by_email(x['email'].strip().lower())
-    if not user:
-        return {'status': 400, 'error': 'credentials'}
-    if user['is_deactivated']:
-        return {'status': 400, 'error': 'deactivated'}
-    if not check_password(x['password'], user['password']):
-        return {'status': 400, 'error': 'credentials'}
-    return {'status': 200, 'user_key': user['user_key']}
-
-def create_session(user_key):
-    conn = get_conn()
-    try:
-        cur        = conn.cursor()
-        token      = gen_token()
-        session_key = gen_key()
-        expires_at = datetime.utcnow() + timedelta(days=A.SESSION_DURATION_DAYS)
-        cur.execute("""
-            INSERT INTO sessions (session_key, user_key, token, expires_at)
-            VALUES (%s, %s, %s, %s)
-        """, (session_key, user_key, token, expires_at))
-        conn.commit()
-        cur.close()
-        return token
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-def validate_session(token):
-    if not token:
-        return None
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT user_key FROM sessions
-            WHERE token = %s AND expires_at > NOW()
-        """, (token,))
-        row = cur.fetchone()
-        cur.close()
-        return row['user_key'] if row else None
-    finally:
-        release_conn(conn)
-
-def logout(token):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
-        conn.commit()
-        cur.close()
-        return {'status': 200}
-    finally:
-        release_conn(conn)
-
-def update_last_seen(user_key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_auth SET last_seen = NOW() WHERE user_key = %s", (user_key,))
-        conn.commit()
-        cur.close()
-    finally:
-        release_conn(conn)
-
-def deactivate_account(x, token):
-    user_key = validate_session(token)
-    if not user_key:
-        return {'status': 401, 'message': A.Unauthorizedmessage}
-    user = get_user_by_key(user_key)
-    if not check_password(x.get('password', ''), user['password']):
-        return {'status': 400, 'message': A.Incorrectpasswordmessage}
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_auth SET is_deactivated = TRUE WHERE user_key = %s", (user_key,))
-        cur.execute("DELETE FROM sessions WHERE user_key = %s", (user_key,))
-        conn.commit()
-        cur.close()
-        return {'status': 200, 'message': A.Accountdeactivatesuccessmsg}
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-def delete_account(x, token):
-    user_key = validate_session(token)
-    if not user_key:
-        return {'status': 401, 'message': A.Unauthorizedmessage}
-    user = get_user_by_key(user_key)
-    if not check_password(x.get('password', ''), user['password']):
-        return {'status': 400, 'message': A.Incorrectpasswordmessage}
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM user_auth WHERE user_key = %s", (user_key,))
-        conn.commit()
-        cur.close()
-        return {'status': 200, 'message': A.Accountdeletesuccessmsg}
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-
-# ═══════════════════════════════════════════════════════════════
-# PROFILE HTML BUILDERS
-# ═══════════════════════════════════════════════════════════════
-def drawerprofilenav(user):
-    name       = user['full_name']
-    university = user.get('university', '')
-    department = user.get('department', '')
-    bio        = user.get('biodescription') or A.defaultbiodescription
-    pic        = user.get('profilepicurl') or A.defaultavatarurl
-    img_style  = "display:block;" if pic else "display:none;"
-    initials   = ''.join([p[0].upper() for p in name.split()[:2]])
-    return f'''<pib><img style="{img_style}" src="{pic}">{initials}</pib><div class="dr-info"><un>{name}</un><lr>{university} &bull; {department}</lr><aside><marquee>{bio}</marquee></aside></div>'''
-
-def profileinfo(user):
-    name       = user['full_name']
-    username   = user['username']
-    department = user.get('department', '')
-    level      = user.get('academic_level', '')
-    university = user.get('university', '')
-    bio        = user.get('biodescription') or A.defaultbiodescription
-    tick       = ' ✓' if user.get('account_level') == 'premium' else ''
-    return f'''<div class="name">{name}{tick}</div>
-<div class="handle">{username}</div>
-<div class="bio">{department} &bull; {level} &bull; {university} &bull; {bio}</div>'''
-def profilestats(user):
-    followers = user.get('numberoffollowers', 0)
-    following = user.get('numberoffollowing', 0)
-    likes     = user.get('numberoflikes', 0)
-    posts     = user.get('numberofposts', 0)
-    def fmt(n):
-        if n >= 1000000: return f"{n/1000000:.1f}M"
-        if n >= 1000:    return f"{n/1000:.1f}K"
-        return str(n)
-    return f'''<div onclick="openUserModal('following')" style="cursor:pointer;"><div class="stat-num">{fmt(following)}</div><div class="stat-label">Following</div></div>
-<div onclick="openUserModal('followers')" style="cursor:pointer;"><div class="stat-num">{fmt(followers)}</div><div class="stat-label">Followers</div></div>
-<div><div class="stat-num">{fmt(likes)}</div><div class="stat-label">Likes</div></div>
-<div><div class="stat-num">{fmt(posts)}</div><div class="stat-label">Posts</div></div>'''
-
-def get_avatar_html(user):
-    pic = user.get('profilepicurl') or A.defaultavatarurl
-    return pic
-
-def settings_payload(user):
-    return {
-        'setProfileName':   user['full_name'],
-        'setProfileHandle': f"{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
-        'setEmail':         user['email'],
-        'setUsername':      f"{user['username']}",
-        'setBio':           user.get('biodescription') or A.defaultbiodescription,
-        'setUniversity':    user.get('university', ''),
-        'setDepartment':    user.get('department', ''),
-        'setProfilePic':    user.get('profilepicurl') or A.defaultavatarurl,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-#  DATA
-# ═══════════════════════════════════════════════════════════════
-def get_global_research(seen_keys=None, limit=10):
-    seen_keys = seen_keys or []
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
-                   pe.data as extras
-            FROM posts p
-            JOIN user_auth u ON u.user_key = p.user_key
-            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-            WHERE p.post_type = 'research'
-            AND p.post_key != ALL(%s)
-            AND p.visibility = 'public'
-            ORDER BY p.created_at DESC
-            LIMIT %s
-        """, (seen_keys, limit))
-        rows = cur.fetchall()
-        cur.close()
-        result = []
-        for r in rows:
-            d = dict(r)
-            d['time_ago'] = time_ago(d.get('created_at'))
-            result.append(d)
-        return result
-    finally:
-        release_conn(conn)
-
-
-def get_user_posts(user_key, tab, seen_keys=None):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        seen_keys = seen_keys or []
-
-        base_select = """
-            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
-                   pe.data as extras,
-                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
-                   EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key = p.post_key AND bk.user_key = %s) as is_bookmarked,
-       EXISTS(SELECT 1 FROM follows f WHERE f.follower_key = %s AND f.following_key = p.user_key) as is_following,
-                   EXTRACT(EPOCH FROM (NOW() - p.created_at))::int as age_seconds
-        """
-
-        if tab == 'posts':
-            query = base_select + """
-                FROM posts p
-                JOIN user_auth u ON u.user_key = p.user_key
-                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-                WHERE p.user_key = %s
-                AND p.post_key != ALL(%s)
-                AND p.post_type NOT IN ('research')
-                ORDER BY p.created_at DESC
-                LIMIT %s
-            """
-            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
-        elif tab == 'research':
-            query = base_select + """
-                FROM posts p
-                JOIN user_auth u ON u.user_key = p.user_key
-                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-                WHERE p.user_key = %s
-                AND p.post_key != ALL(%s)
-                AND p.post_type = 'research'
-                ORDER BY p.created_at DESC
-                LIMIT %s
-            """
-            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
-        elif tab == 'saved':
-            query = base_select + """
-                FROM posts p
-                JOIN user_auth u ON u.user_key = p.user_key
-                JOIN bookmarks b ON b.post_key = p.post_key
-                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-                WHERE b.user_key = %s
-                AND p.post_key != ALL(%s)
-                ORDER BY b.saved_at DESC
-                LIMIT %s
-            """
-            cur.execute(query, (user_key, user_key, user_key, user_key, seen_keys, A.FEED_SCROLL_COUNT))
-        else:
-            return []
-
-        posts = cur.fetchall()
-        cur.close()
-
-        result = []
-        for p in posts:
-            post = dict(p)
-            # Format time_ago
-            age = post.pop('age_seconds', 0) or 0
-            if age < 60:
-                post['time_ago'] = 'just now'
-            elif age < 3600:
-                post['time_ago'] = f"{age // 60}m ago"
-            elif age < 86400:
-                post['time_ago'] = f"{age // 3600}h ago"
-            elif age < 604800:
-                post['time_ago'] = f"{age // 86400}d ago"
-            else:
-                post['time_ago'] = f"{age // 604800}w ago"
-            result.append(post)
-        return result
-    finally:
-        release_conn(conn)
-
-def get_post(post_key, user_key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
-                   pe.data as extras,
-                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
-                   EXISTS(SELECT 1 FROM bookmarks b WHERE b.post_key = p.post_key AND b.user_key = %s) as is_bookmarked,
-                   EXTRACT(EPOCH FROM (NOW() - p.created_at))::int as age_seconds
-            FROM posts p
-            JOIN user_auth u ON u.user_key = p.user_key
-            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-            WHERE p.post_key = %s
-        """, (user_key, user_key, post_key))
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        post = dict(row)
-        age = post.pop('age_seconds', 0) or 0
-        if age < 60:    post['time_ago'] = 'just now'
-        elif age < 3600:  post['time_ago'] = f"{age // 60}m ago"
-        elif age < 86400: post['time_ago'] = f"{age // 3600}h ago"
-        elif age < 604800:post['time_ago'] = f"{age // 86400}d ago"
-        else:             post['time_ago'] = f"{age // 604800}w ago"
-        return post
-    finally:
-        release_conn(conn)
-
-def get_announcements(limit=20):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT a.*, u.full_name, u.profilepicurl
-            FROM announcements a
-            LEFT JOIN user_auth u ON u.user_key = a.author_key
-            WHERE a.is_active = TRUE
-            ORDER BY a.created_at DESC
-            LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall()
-        cur.close()
-        result = []
-        for r in rows:
-            ann = dict(r)
-            ann['time_ago'] = time_ago(ann.get('created_at'))
-            result.append(ann)
-        # If no announcements yet, return platform defaults
-        if not result:
-            result = [{
-                'ann_key': 'default-1',
-                'title': 'Welcome to Trends!',
-                'body': 'Connect with researchers, students and academics across Nigerian universities. Share your work, collaborate and grow.',
-                'ann_type': 'update',
-                'priority': 'normal',
-                'time_ago': 'just now',
-                'views': 0,
-                'full_name': 'Trends Team'
-            }]
-        return result
-    finally:
-        release_conn(conn)
-
-def get_followers(user_key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT u.user_key, u.full_name, u.username, u.profilepicurl,
-                   u.department, u.university, u.account_level
-            FROM user_auth u
-            JOIN follows f ON f.follower_key = u.user_key
-            WHERE f.following_key = %s
-            ORDER BY f.followed_at DESC
-        """, (user_key,))
-        rows = cur.fetchall()
-        cur.close()
-        return [dict(r) for r in rows]
-    finally:
-        release_conn(conn)
-
-def get_following(user_key):
-    conn = get_conn()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT u.user_key, u.full_name, u.username, u.profilepicurl,
-                   u.department, u.university, u.account_level
-            FROM user_auth u
-            JOIN follows f ON f.following_key = u.user_key
-            WHERE f.follower_key = %s
-            ORDER BY f.followed_at DESC
-        """, (user_key,))
-        rows = cur.fetchall()
-        cur.close()
-        return [dict(r) for r in rows]
-    finally:
-        release_conn(conn)
-
-def build_user_list_html(users, current_user_key):
-    if not users:
-        return A.nofollowingorfollowersgeneral
-    html = ''
-    for u in users:
-        tick      = ' ✓' if u.get('account_level') == 'premium' else ''
-        pic       = u.get('profilepicurl') or ''
-        img_style = f'src="{pic}"' if pic else 'src="" style="display:none"'
-        html += f'''<div class="user-item">
-  <img {img_style} alt="profile">
-  <div class="user-item-info">
-    <div class="user-item-name">{u["full_name"]}{tick}</div>
-    <div class="user-item-handle">{u["username"]}</div>
-    <div class="user-item-dept">{u.get("department","")} &bull; {u.get("university","")}</div>
-  </div>
-  <button class="user-follow-btn" onclick="toggleFollow('{u["user_key"]}',this)">Follow</button>
-</div>'''
-    return html
-
-def update_avatar(x, token):
-    user_key = validate_session(token)
-    if not user_key:
-        return {'status': 401, 'message': A.Unauthorizedmessage}
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_auth SET profilepicurl = %s WHERE user_key = %s",
-                    (x.get('profilepicurl', ''), user_key))
-        conn.commit()
-        cur.close()
-        return {'status': 200, 'message': A.Avatarupdatesuccessmessage,
-                'avatar': x.get('profilepicurl', '')}
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-def remove_avatar(token):
-    user_key = validate_session(token)
-    if not user_key:
-        return {'status': 401, 'message': A.Unauthorizedmessage}
-    conn = get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_auth SET profilepicurl = '' WHERE user_key = %s", (user_key,))
-        conn.commit()
-        cur.close()
-        return {'status': 200, 'message': A.Avatarremovesuccessmessage, 'avatar': ''}
-    except Exception as e:
-        conn.rollback()
-        raise
-    finally:
-        release_conn(conn)
-
-
-# ═══════════════════════════════════════════════════════════════
-# TRENDING FEED
-# ═══════════════════════════════════════════════════════════════
 import random
 
 def generate_feed_sequence(n):
@@ -1079,6 +241,16 @@ def toggle_like(x, token):
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
     post_key = x.get('post_key')
+    # Prevent self-like
+    c0 = get_conn()
+    try:
+        r0 = c0.cursor(cursor_factory=RealDictCursor)
+        r0.execute("SELECT user_key FROM posts WHERE post_key=%s", (post_key,))
+        owner = r0.fetchone()
+        if owner and owner['user_key'] == user_key:
+            return {'status': 400, 'message': "You can't like your own post"}
+    finally:
+        release_conn(c0)
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -1428,6 +600,24 @@ def create_post(x, token):
     user_key = validate_session(token)
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
+    # Validate post types
+    import datetime as _dtv
+    _ptype = x.get('type','text')
+    if _ptype == 'event':
+        _ed = (x.get('event') or {}).get('date','')
+        if _ed:
+            try:
+                if _dtv.datetime.strptime(_ed,'%Y-%m-%d').date() < _dtv.date.today():
+                    return {'status':400,'message':'Event date must be in the future'}
+            except: pass
+    if _ptype == 'bounty':
+        try:
+            if float((x.get('bounty') or {}).get('amount',0) or 0) <= 0:
+                return {'status':400,'message':'Bounty reward must be greater than 0'}
+        except: pass
+    if _ptype == 'research':
+        if not (x.get('research') or {}).get('title','').strip():
+            return {'status':400,'message':'Research post requires a title'}
 
     post_key       = gen_key()
     post_type      = x.get('type', 'text')
@@ -1799,10 +989,11 @@ def search(x, token):
                    u.full_name, u.username, u.profilepicurl, u.account_level
             FROM posts p
             JOIN user_auth u ON u.user_key = p.user_key
-            WHERE p.content ILIKE %s AND p.visibility = 'public'
+            WHERE (p.content ILIKE %s OR COALESCE(pe.data::text,'') ILIKE %s)
+            AND p.visibility = 'public'
             ORDER BY p.like_count DESC
             LIMIT 20
-        """, (pattern,))
+        """, (pattern, pattern))
         post_results = []
         for r in cur.fetchall():
             p = dict(r)
@@ -2214,6 +1405,14 @@ def Frontend_personalizer(x, user, token=None):
 # ═══════════════════════════════════════════════════════════════
 # FRONTEND REQUEST EXECUTOR
 # ═══════════════════════════════════════════════════════════════
+# Simple in-memory rate limiter
+_rl = {}
+def _rate_ok(key, limit=100, window=60):
+    import time; now=time.time()
+    _rl[key] = [t for t in _rl.get(key,[]) if now-t<window]
+    if len(_rl[key])>=limit: return False
+    _rl[key].append(now); return True
+
 def Frontend_request_executor(x, token=None):
     status = x.get('status', '')
 
@@ -2226,9 +1425,27 @@ def Frontend_request_executor(x, token=None):
                 'email':    A.Emailexistonsignupmessage,
                 'username': A.Usernameexistonsignupmessage,
             }
+            # Increment failed attempt counter
+            if _email_bf:
+                try:
+                    conn_fa = get_conn()
+                    cur_fa = conn_fa.cursor(cursor_factory=RealDictCursor)
+                    cur_fa.execute("SELECT failed_login_attempts FROM user_auth WHERE email=%s",(_email_bf,))
+                    _uf = cur_fa.fetchone()
+                    if _uf:
+                        _attempts = (_uf.get('failed_login_attempts') or 0) + 1
+                        if _attempts >= 5:
+                            import datetime as _dbt2
+                            _lock = _dbt2.datetime.utcnow() + _dbt2.timedelta(minutes=15)
+                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s,locked_until=%s WHERE email=%s",(_attempts,_lock,_email_bf))
+                        else:
+                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s WHERE email=%s",(_attempts,_email_bf))
+                        conn_fa.commit()
+                    release_conn(conn_fa)
+                except: pass
             return {'status': 400, 'message': msg_map.get(check.get('error'), A.Genericerror)}
         user_key = insert_user(x)
-        new_token = create_session(user_key)
+        new_token = create_session(user_key, x.get('device_info', ''))
         user      = get_user_by_key(user_key)
         ans       = {'status': 200, 'message': A.Successfulsignupmessage}
         ans      |= Frontend_personalizer(x, user, new_token)
@@ -2236,17 +1453,61 @@ def Frontend_request_executor(x, token=None):
 
     # ── SIGNIN ────────────────────────────────────────────────
     elif status == 'signin':
+        # Brute force protection
+        _email_bf = x.get('email','').strip().lower()
+        if _email_bf:
+            conn_bf = get_conn()
+            try:
+                cur_bf = conn_bf.cursor(cursor_factory=RealDictCursor)
+                cur_bf.execute("SELECT failed_login_attempts,locked_until FROM user_auth WHERE email=%s",(_email_bf,))
+                _u_bf = cur_bf.fetchone()
+                if _u_bf and _u_bf.get('locked_until'):
+                    import datetime as _dbt
+                    _lk = _u_bf['locked_until']
+                    if hasattr(_lk,'replace'): _lk=_lk.replace(tzinfo=None)
+                    if _dbt.datetime.utcnow() < _lk:
+                        _mins = max(1, int((_lk-_dbt.datetime.utcnow()).total_seconds()//60)+1)
+                        release_conn(conn_bf)
+                        return {'status':429,'message':f'Too many failed attempts. Try again in {_mins} minute(s).'}
+            finally:
+                release_conn(conn_bf)
         check = verify_signin_data(x)
         if check['status'] != 200:
             msg_map = {
                 'credentials': A.Invalidcredentialsmessage,
                 'deactivated': A.Accountdeactivatedmessage,
             }
+            # Increment failed attempt counter
+            if _email_bf:
+                try:
+                    conn_fa = get_conn()
+                    cur_fa = conn_fa.cursor(cursor_factory=RealDictCursor)
+                    cur_fa.execute("SELECT failed_login_attempts FROM user_auth WHERE email=%s",(_email_bf,))
+                    _uf = cur_fa.fetchone()
+                    if _uf:
+                        _attempts = (_uf.get('failed_login_attempts') or 0) + 1
+                        if _attempts >= 5:
+                            import datetime as _dbt2
+                            _lock = _dbt2.datetime.utcnow() + _dbt2.timedelta(minutes=15)
+                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s,locked_until=%s WHERE email=%s",(_attempts,_lock,_email_bf))
+                        else:
+                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s WHERE email=%s",(_attempts,_email_bf))
+                        conn_fa.commit()
+                    release_conn(conn_fa)
+                except: pass
             return {'status': 400, 'message': msg_map.get(check.get('error'), A.Genericerror)}
         user_key  = check['user_key']
-        new_token = create_session(user_key)
+        new_token = create_session(user_key, x.get('device_info', ''))
         user      = get_user_by_key(user_key)
         update_last_seen(user_key)
+        # Reset brute force counter on success
+        try:
+            conn_rs2 = get_conn()
+            cur_rs2 = conn_rs2.cursor()
+            cur_rs2.execute("UPDATE user_auth SET failed_login_attempts=0,locked_until=NULL WHERE user_key=%s",(user_key,))
+            conn_rs2.commit()
+            release_conn(conn_rs2)
+        except: pass
         # Signin loads real data
         followers_data = get_followers(user_key)
         following_data = get_following(user_key)
@@ -2283,6 +1544,21 @@ def Frontend_request_executor(x, token=None):
         users = get_suggestions(user_key)
         return {'status': 200, 'suggestions_html': build_suggestions_html(users)}
 
+    elif status == 'get_trending_hashtags':
+        _htc = get_conn()
+        try:
+            import re as _re
+            _htcc = _htc.cursor(cursor_factory=RealDictCursor)
+            _htcc.execute("SELECT content FROM posts WHERE created_at>NOW()-INTERVAL '7 days' AND visibility='public' AND content LIKE '%#%' LIMIT 500")
+            _htrows = _htcc.fetchall()
+            _htags = {}
+            for _htr in _htrows:
+                for _t in _re.findall(r'#([A-Za-z0-9_]+)', _htr['content'] or ''):
+                    _htags[_t.lower()] = _htags.get(_t.lower(),0)+1
+            _htsorted = sorted(_htags.items(),key=lambda x:x[1],reverse=True)[:20]
+            return {'status':200,'hashtags':[{'tag':t,'count':c} for t,c in _htsorted]}
+        finally: release_conn(_htc)
+
     elif status == 'get_trending_topics':
         topics = get_trending_topics()
         return {'status': 200, 'trending_topics_html': build_trending_topics_html(topics)}
@@ -2291,9 +1567,67 @@ def Frontend_request_executor(x, token=None):
     elif status == 'toggle_like':     return toggle_like(x, token)
     elif status == 'post_comment':    return post_comment(x, token)
     elif status == 'get_comments':    return {'status': 200, 'comments': get_comments(x)}
+    elif status == 'like_comment':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _clkey = x.get('comment_key')
+        _clc = get_conn()
+        try:
+            _clcc = _clc.cursor(cursor_factory=RealDictCursor)
+            _clcc.execute("SELECT 1 FROM comment_likes WHERE user_key=%s AND comment_key=%s",(user_key,_clkey))
+            if _clcc.fetchone():
+                _clcc.execute("DELETE FROM comment_likes WHERE user_key=%s AND comment_key=%s",(user_key,_clkey))
+                _clcc.execute("UPDATE comments SET like_count=GREATEST(0,COALESCE(like_count,0)-1) WHERE comment_key=%s RETURNING like_count",(_clkey,))
+                _claction='unliked'
+            else:
+                _clcc.execute("INSERT INTO comment_likes VALUES(%s,%s) ON CONFLICT DO NOTHING",(user_key,_clkey))
+                _clcc.execute("UPDATE comments SET like_count=COALESCE(like_count,0)+1 WHERE comment_key=%s RETURNING like_count",(_clkey,))
+                _claction='liked'
+            _clr = _clcc.fetchone()
+            _clc.commit()
+            return {'status':200,'action':_claction,'like_count':_clr['like_count'] if _clr else 0}
+        finally: release_conn(_clc)
+
     elif status == 'delete_comment':  return delete_comment(x, token)
     elif status == 'toggle_bookmark': return toggle_bookmark(x, token)
     elif status == 'toggle_follow':   return toggle_follow(x, token)
+    elif status == 'report':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _rtype = x.get('target_type')
+        _rkey  = x.get('target_key')
+        _rreason = x.get('reason','Inappropriate content')
+        if not _rtype or not _rkey: return {'status':400,'message':'Missing target'}
+        _rc = get_conn()
+        try:
+            _rcc = _rc.cursor()
+            _rcc.execute(
+                "INSERT INTO reports(report_key,reporter_key,target_type,target_key,reason) VALUES(%s,%s,%s,%s,%s)",
+                (gen_key(),user_key,_rtype,_rkey,_rreason)
+            )
+            _rc.commit()
+            return {'status':200,'message':'Report submitted. We will review it.'}
+        except: return {'status':500,'message':'Could not submit report'}
+        finally: release_conn(_rc)
+
+    elif status == 'toggle_mute':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _mtkey = x.get('target_key')
+        _mtc = get_conn()
+        try:
+            _mtcc = _mtc.cursor()
+            _mtcc.execute("SELECT 1 FROM mutes WHERE muter_key=%s AND muted_key=%s",(user_key,_mtkey))
+            if _mtcc.fetchone():
+                _mtcc.execute("DELETE FROM mutes WHERE muter_key=%s AND muted_key=%s",(user_key,_mtkey))
+                _mta='unmuted'
+            else:
+                _mtcc.execute("INSERT INTO mutes(muter_key,muted_key) VALUES(%s,%s) ON CONFLICT DO NOTHING",(user_key,_mtkey))
+                _mta='muted'
+            _mtc.commit()
+            return {'status':200,'action':_mta,'message':f'User {_mta}'}
+        finally: release_conn(_mtc)
+
     elif status == 'toggle_block':    return toggle_block(x, token)
     elif status == 'vote_poll':       return vote_poll(x, token)
     elif status == 'rsvp_event':      return rsvp_event(x, token)
@@ -2301,6 +1635,44 @@ def Frontend_request_executor(x, token=None):
 
     # ── CREATE ────────────────────────────────────────────────
     elif status == 'create_post':  return create_post(x, token)
+    elif status == 'edit_post':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _epostkey = x.get('post_key')
+        _econtent = (x.get('content') or '').strip()
+        if not _econtent: return {'status':400,'message':'Content cannot be empty'}
+        _ec = get_conn()
+        try:
+            import datetime as _dt3
+            _ecc = _ec.cursor(cursor_factory=RealDictCursor)
+            _ecc.execute("SELECT user_key,created_at FROM posts WHERE post_key=%s",(_epostkey,))
+            _ep = _ecc.fetchone()
+            if not _ep: return {'status':404,'message':'Post not found'}
+            if _ep['user_key']!=user_key: return {'status':403,'message':'Not your post'}
+            _age = (_dt3.datetime.utcnow()-_ep['created_at'].replace(tzinfo=None)).total_seconds()
+            if _age > 900: return {'status':400,'message':'Posts can only be edited within 15 minutes'}
+            _ecc.execute("UPDATE posts SET content=%s,edited_at=NOW() WHERE post_key=%s",(_econtent,_epostkey))
+            _ec.commit()
+            return {'status':200,'message':'Post updated'}
+        finally: release_conn(_ec)
+
+    elif status == 'pin_post':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _ppkey = x.get('post_key')
+        _pc = get_conn()
+        try:
+            _pcc = _pc.cursor(cursor_factory=RealDictCursor)
+            _pcc.execute("SELECT user_key FROM posts WHERE post_key=%s",(_ppkey,))
+            _pp = _pcc.fetchone()
+            if not _pp or _pp['user_key']!=user_key: return {'status':403,'message':'Not your post'}
+            _pcc.execute("UPDATE posts SET is_pinned=FALSE WHERE user_key=%s",(user_key,))
+            _pcc.execute("UPDATE posts SET is_pinned=NOT COALESCE(is_pinned,FALSE) WHERE post_key=%s RETURNING is_pinned",(_ppkey,))
+            _pr = _pcc.fetchone()
+            _pc.commit()
+            return {'status':200,'pinned': _pr['is_pinned'] if _pr else False}
+        finally: release_conn(_pc)
+
     elif status == 'delete_post':  return delete_post(x, token)
 
     # ── PROFILE ───────────────────────────────────────────────
@@ -2414,15 +1786,472 @@ def Frontend_request_executor(x, token=None):
 
     # ── MESSAGES ──────────────────────────────────────────────
     elif status == 'get_conversations':   return get_conversations(token)
+    elif status == 'delete_conversation':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _dck = x.get('conversation_key')
+        _dcc = get_conn()
+        try:
+            _dccc = _dcc.cursor()
+            _dccc.execute("SELECT 1 FROM conversations WHERE conversation_key=%s AND (user1_key=%s OR user2_key=%s)",(_dck,user_key,user_key))
+            if not _dccc.fetchone(): return {'status':403,'message':'Not your conversation'}
+            _dccc.execute("DELETE FROM messages WHERE conversation_key=%s",(_dck,))
+            _dccc.execute("DELETE FROM conversations WHERE conversation_key=%s",(_dck,))
+            _dcc.commit()
+            return {'status':200,'message':'Conversation deleted'}
+        finally: release_conn(_dcc)
+
     elif status == 'get_dm_messages':     return get_dm_messages(x, token)
+    elif status == 'typing_ping':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conv_key = x.get('conversation_key')
+        if conv_key:
+            _tc = get_conn()
+            try:
+                _tcc = _tc.cursor()
+                _tcc.execute("UPDATE conversations SET last_typing_key=%s,last_typing_at=NOW() WHERE conversation_key=%s",(user_key,conv_key))
+                _tc.commit()
+            except: pass
+            finally: release_conn(_tc)
+        return {'status':200}
+
+    elif status == 'get_typing':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conv_key = x.get('conversation_key')
+        if not conv_key: return {'status':200,'typing':False}
+        _tc2 = get_conn()
+        try:
+            import datetime as _dt2
+            _tcc2 = _tc2.cursor(cursor_factory=RealDictCursor)
+            _tcc2.execute(
+                "SELECT c.last_typing_key,c.last_typing_at,u.full_name FROM conversations c LEFT JOIN user_auth u ON u.user_key=c.last_typing_key WHERE c.conversation_key=%s",
+                (conv_key,)
+            )
+            row = _tcc2.fetchone()
+            if row and row['last_typing_key'] and row['last_typing_key']!=user_key and row['last_typing_at']:
+                age = (_dt2.datetime.utcnow()-row['last_typing_at'].replace(tzinfo=None)).total_seconds()
+                if age < 4:
+                    return {'status':200,'typing':True,'name':row['full_name']}
+            return {'status':200,'typing':False}
+        finally: release_conn(_tc2)
+
     elif status == 'send_dm':             return send_dm(x, token)
     elif status == 'get_global_messages': return get_global_messages()
     elif status == 'send_global_message': return send_global_message(x, token)
 
     # ── UNKNOWN ───────────────────────────────────────────────
+    elif status == 'request_password_reset':
+        email = x.get('email','').strip().lower()
+        if not email: return {'status':400,'message':'Email required'}
+        conn_pr = get_conn()
+        try:
+            cur_pr = conn_pr.cursor(cursor_factory=RealDictCursor)
+            cur_pr.execute("SELECT user_key FROM user_auth WHERE email=%s",(email,))
+            user = cur_pr.fetchone()
+            if not user: return {'status':404,'message':'No account with that email'}
+            import random as _rand3, datetime as _dt4
+            code  = str(_rand3.randint(100000,999999))
+            token2 = gen_key()
+            expires = _dt4.datetime.utcnow() + _dt4.timedelta(minutes=15)
+            cur_pr.execute("INSERT INTO password_resets(token,user_key,code,expires_at) VALUES(%s,%s,%s,%s) ON CONFLICT(user_key) DO UPDATE SET token=%s,code=%s,expires_at=%s",(token2,user['user_key'],code,expires,token2,code,expires))
+            conn_pr.commit()
+            return {'status':200,'code':code,'token':token2,'message':'Reset code generated'}
+        except Exception as ex: return {'status':500,'message':str(ex)}
+        finally: release_conn(conn_pr)
+
+    elif status == 'confirm_password_reset':
+        _tok = x.get('token',''); _code = x.get('code',''); _np = x.get('new_password','')
+        if len(_np)<8: return {'status':400,'message':'Password must be at least 8 characters'}
+        conn_cp = get_conn()
+        try:
+            import datetime as _dt5, bcrypt as _bc2
+            cur_cp = conn_cp.cursor(cursor_factory=RealDictCursor)
+            cur_cp.execute("SELECT * FROM password_resets WHERE token=%s AND code=%s",(_tok,_code))
+            row = cur_cp.fetchone()
+            if not row: return {'status':400,'message':'Invalid or expired code'}
+            if _dt5.datetime.utcnow() > row['expires_at'].replace(tzinfo=None): return {'status':400,'message':'Code expired'}
+            hashed = _bc2.hashpw(_np.encode(),_bc2.gensalt()).decode()
+            cur_cp.execute("UPDATE user_auth SET password_hash=%s WHERE user_key=%s",(hashed,row['user_key']))
+            cur_cp.execute("DELETE FROM password_resets WHERE user_key=%s",(row['user_key'],))
+            conn_cp.commit()
+            return {'status':200,'message':'Password reset successfully'}
+        finally: release_conn(conn_cp)
+
+    elif status == 'verify_email':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        code = x.get('code','')
+        conn_ve = get_conn()
+        try:
+            cur_ve = conn_ve.cursor(cursor_factory=RealDictCursor)
+            cur_ve.execute("SELECT code FROM email_verifications WHERE user_key=%s",(user_key,))
+            row = cur_ve.fetchone()
+            if not row or row['code']!=code: return {'status':400,'message':'Invalid code'}
+            cur_ve.execute("UPDATE user_auth SET is_verified=TRUE WHERE user_key=%s",(user_key,))
+            cur_ve.execute("DELETE FROM email_verifications WHERE user_key=%s",(user_key,))
+            conn_ve.commit()
+            return {'status':200,'message':'Account verified!'}
+        finally: release_conn(conn_ve)
+
+    elif status == 'get_profile_by_username':
+        uname = x.get('username','').strip()
+        if not uname: return {'status':400,'message':'Username required'}
+        conn_gu = get_conn()
+        try:
+            cur_gu = conn_gu.cursor(cursor_factory=RealDictCursor)
+            cur_gu.execute("SELECT user_key FROM user_auth WHERE username=%s OR user_key=%s",(uname,uname))
+            row = cur_gu.fetchone()
+            return {'status':200,'user_key':row['user_key']} if row else {'status':404,'message':'User not found'}
+        finally: release_conn(conn_gu)
+
+    elif status == 'rsvp_event':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _pk = x.get('post_key')
+        conn_rv = get_conn()
+        try:
+            cur_rv = conn_rv.cursor(cursor_factory=RealDictCursor)
+            cur_rv.execute("SELECT 1 FROM post_applications WHERE post_key=%s AND applicant_key=%s AND note='rsvp'",(_pk,user_key))
+            if cur_rv.fetchone():
+                cur_rv.execute("DELETE FROM post_applications WHERE post_key=%s AND applicant_key=%s AND note='rsvp'",(_pk,user_key))
+                action='not_going'
+            else:
+                cur_rv.execute("INSERT INTO post_applications(application_key,post_key,applicant_key,note,status) VALUES(%s,%s,%s,'rsvp','accepted') ON CONFLICT DO NOTHING",(gen_key(),_pk,user_key))
+                action='going'
+            conn_rv.commit()
+            return {'status':200,'action':action}
+        finally: release_conn(conn_rv)
+
+    elif status == 'get_rsvps':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _pk = x.get('post_key')
+        conn_gr = get_conn()
+        try:
+            cur_gr = conn_gr.cursor(cursor_factory=RealDictCursor)
+            cur_gr.execute("SELECT u.full_name,u.username,u.profilepicurl,u.university FROM post_applications pa JOIN user_auth u ON u.user_key=pa.applicant_key WHERE pa.post_key=%s AND pa.note='rsvp'",(_pk,))
+            rows = cur_gr.fetchall()
+            return {'status':200,'attendees':[dict(r) for r in rows]}
+        finally: release_conn(conn_gr)
+
+    elif status == 'apply_to_post':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _pk = x.get('post_key'); _note = x.get('note','')
+        conn_aj = get_conn()
+        try:
+            cur_aj = conn_aj.cursor()
+            cur_aj.execute("SELECT 1 FROM post_applications WHERE post_key=%s AND applicant_key=%s AND note!='rsvp'",(_pk,user_key))
+            if cur_aj.fetchone(): return {'status':400,'message':'You already applied'}
+            cur_aj.execute("INSERT INTO post_applications(application_key,post_key,applicant_key,note,status) VALUES(%s,%s,%s,%s,'pending')",(gen_key(),_pk,user_key,_note))
+            conn_aj.commit()
+            return {'status':200,'message':'Application submitted!'}
+        finally: release_conn(conn_aj)
+
+    elif status == 'get_my_applications':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_ap = get_conn()
+        try:
+            cur_ap = conn_ap.cursor(cursor_factory=RealDictCursor)
+            sql_ap = "SELECT pa.*,p.content,pe.data as extras,u.full_name as poster_name FROM post_applications pa JOIN posts p ON p.post_key=pa.post_key LEFT JOIN post_extras pe ON pe.post_key=pa.post_key LEFT JOIN user_auth u ON u.user_key=p.user_key WHERE pa.applicant_key=%s ORDER BY pa.created_at DESC"
+            cur_ap.execute(sql_ap,(user_key,))
+            rows = cur_ap.fetchall()
+            return {'status':200,'applications':[dict(r) for r in rows]}
+        finally: release_conn(conn_ap)
+
+    elif status == 'get_post_applications':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _pk = x.get('post_key')
+        conn_pa = get_conn()
+        try:
+            cur_pa = conn_pa.cursor(cursor_factory=RealDictCursor)
+            cur_pa.execute("SELECT user_key FROM posts WHERE post_key=%s",(_pk,))
+            owner = cur_pa.fetchone()
+            if not owner or owner['user_key']!=user_key: return {'status':403,'message':'Not your post'}
+            sql_pa = "SELECT pa.*,u.full_name,u.username,u.profilepicurl,u.department,u.university FROM post_applications pa JOIN user_auth u ON u.user_key=pa.applicant_key WHERE pa.post_key=%s ORDER BY pa.created_at DESC"
+            cur_pa.execute(sql_pa,(_pk,))
+            rows = cur_pa.fetchall()
+            return {'status':200,'applications':[dict(r) for r in rows]}
+        finally: release_conn(conn_pa)
+
+    elif status == 'mark_sold':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _pk = x.get('post_key')
+        conn_ms = get_conn()
+        try:
+            cur_ms = conn_ms.cursor(cursor_factory=RealDictCursor)
+            cur_ms.execute("SELECT user_key FROM posts WHERE post_key=%s",(_pk,))
+            post = cur_ms.fetchone()
+            if not post or post['user_key']!=user_key: return {'status':403,'message':'Not your post'}
+            cur_ms.execute("UPDATE posts SET show_in_feed=FALSE WHERE post_key=%s",(_pk,))
+            conn_ms.commit()
+            return {'status':200,'message':'Marked as sold'}
+        finally: release_conn(conn_ms)
+
+    elif status == 'get_my_data':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_gd = get_conn()
+        try:
+            cur_gd = conn_gd.cursor(cursor_factory=RealDictCursor)
+            cur_gd.execute("SELECT full_name,username,email,bio,university,department,academic_level,created_at FROM user_auth WHERE user_key=%s",(user_key,))
+            profile = cur_gd.fetchone()
+            cur_gd.execute("SELECT post_key,post_type,content,created_at,like_count,comment_count,view_count FROM posts WHERE user_key=%s ORDER BY created_at DESC LIMIT 100",(user_key,))
+            posts = cur_gd.fetchall()
+            return {'status':200,'profile':dict(profile) if profile else {},'posts':[dict(p) for p in posts]}
+        finally: release_conn(conn_gd)
+
+    elif status == 'get_active_sessions':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_as = get_conn()
+        try:
+            cur_as = conn_as.cursor(cursor_factory=RealDictCursor)
+            cur_as.execute("SELECT session_key,created_at,device_info FROM sessions WHERE user_key=%s ORDER BY created_at DESC LIMIT 10",(user_key,))
+            rows = cur_as.fetchall()
+            sessions = [{'session_key':r['session_key'],'device':r.get('device_info','Unknown'),'created_at':str(r['created_at'])[:16]} for r in rows]
+            return {'status':200,'sessions':sessions}
+        finally: release_conn(conn_as)
+
+    elif status == 'revoke_session':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        _sk = x.get('session_key')
+        conn_rs = get_conn()
+        try:
+            cur_rs = conn_rs.cursor()
+            cur_rs.execute("DELETE FROM sessions WHERE session_key=%s AND user_key=%s",(_sk,user_key))
+            conn_rs.commit()
+            return {'status':200,'message':'Session revoked'}
+        finally: release_conn(conn_rs)
+
+    elif status == 'check_new_posts':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        latest_key = x.get('latest_key','')
+        if not latest_key: return {'status':200,'new_count':0}
+        conn_cn = get_conn()
+        try:
+            cur_cn = conn_cn.cursor(cursor_factory=RealDictCursor)
+            cur_cn.execute("SELECT COUNT(*) as cnt FROM posts p WHERE p.post_key!=%s AND p.visibility='public' AND p.show_in_feed=TRUE AND p.created_at>(SELECT created_at FROM posts WHERE post_key=%s)",(latest_key,latest_key))
+            row = cur_cn.fetchone()
+            return {'status':200,'new_count':int(row['cnt']) if row else 0}
+        except: return {'status':200,'new_count':0}
+        finally: release_conn(conn_cn)
+
+    elif status == 'ping_online':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_po = get_conn()
+        try:
+            cur_po = conn_po.cursor()
+            cur_po.execute("UPDATE user_auth SET last_seen=NOW() WHERE user_key=%s",(user_key,))
+            conn_po.commit()
+        except: pass
+        finally: release_conn(conn_po)
+        return {'status':200}
+
+    elif status == 'dismiss_notification':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        notif_key = x.get('notif_key')
+        conn_dn = get_conn()
+        try:
+            cur_dn = conn_dn.cursor()
+            cur_dn.execute("DELETE FROM notifications WHERE notification_key=%s AND recipient_key=%s",(notif_key,user_key))
+            conn_dn.commit()
+            return {'status':200}
+        finally: release_conn(conn_dn)
+
+
+    elif status == 'mark_dm_read':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        convo_key = x.get('convo_key')
+        conn_mr = get_conn()
+        try:
+            cur_mr = conn_mr.cursor()
+            cur_mr.execute("UPDATE messages SET read_at=NOW() WHERE conversation_key=%s AND sender_key!=%s AND read_at IS NULL",(convo_key, user_key))
+            conn_mr.commit()
+            return {'status':200}
+        finally: release_conn(conn_mr)
+
+    elif status == 'get_unread_dm_count':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_ud = get_conn()
+        try:
+            cur_ud = conn_ud.cursor(cursor_factory=RealDictCursor)
+            cur_ud.execute("SELECT COUNT(*) as cnt FROM messages m JOIN conversations c ON c.conversation_key=m.conversation_key WHERE (c.user1_key=%s OR c.user2_key=%s) AND m.sender_key!=%s AND m.read_at IS NULL",(user_key,user_key,user_key))
+            row = cur_ud.fetchone()
+            return {'status':200,'count':int(row['cnt']) if row else 0}
+        finally: release_conn(conn_ud)
+
+    elif status == 'cancel_event':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        post_key = x.get('post_key'); reason = x.get('reason','Event has been cancelled')
+        conn_ce = get_conn()
+        try:
+            cur_ce = conn_ce.cursor(cursor_factory=RealDictCursor)
+            cur_ce.execute("SELECT user_key,content FROM posts WHERE post_key=%s AND post_type='event'",(post_key,))
+            ev = cur_ce.fetchone()
+            if not ev or ev['user_key']!=user_key: return {'status':403,'message':'Not your event'}
+            cur_ce.execute("UPDATE posts SET show_in_feed=FALSE WHERE post_key=%s",(post_key,))
+            cur_ce.execute("SELECT applicant_key FROM post_applications WHERE post_key=%s AND note='rsvp'",(post_key,))
+            rsvps = cur_ce.fetchall()
+            for r in rsvps:
+                cur_ce.execute("INSERT INTO notifications(notification_key,recipient_key,sender_key,type,post_key,message,created_at) VALUES(%s,%s,%s,'event_cancelled',%s,%s,NOW())",(gen_key(),r['applicant_key'],user_key,post_key,f"Event cancelled: {reason}"))
+            conn_ce.commit()
+            return {'status':200,'notified':len(rsvps)}
+        finally: release_conn(conn_ce)
+
+    elif status == 'get_research_tags':
+        conn_rt = get_conn()
+        try:
+            cur_rt = conn_rt.cursor(cursor_factory=RealDictCursor)
+            cur_rt.execute("SELECT pe.data->>'tags' as tags FROM post_extras pe JOIN posts p ON p.post_key=pe.post_key WHERE p.post_type='research' AND pe.data->>'tags' IS NOT NULL ORDER BY p.created_at DESC LIMIT 200")
+            rows = cur_rt.fetchall()
+            from collections import Counter; import json
+            all_tags = []
+            for r in rows:
+                try:
+                    tags = json.loads(r['tags']) if isinstance(r['tags'],str) else r['tags']
+                    if isinstance(tags,list): all_tags.extend(tags)
+                except: pass
+            top = Counter(all_tags).most_common(30)
+            return {'status':200,'tags':[{'tag':t,'count':c} for t,c in top]}
+        finally: release_conn(conn_rt)
+
+    elif status == 'follow_research_tag':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        tag = x.get('tag','').strip().lower()
+        if not tag: return {'status':400,'message':'Tag required'}
+        conn_frt = get_conn()
+        try:
+            cur_frt = conn_frt.cursor()
+            cur_frt.execute("SELECT 1 FROM user_tag_follows WHERE user_key=%s AND tag=%s",(user_key,tag))
+            if cur_frt.fetchone():
+                cur_frt.execute("DELETE FROM user_tag_follows WHERE user_key=%s AND tag=%s",(user_key,tag))
+                action='unfollowed'
+            else:
+                cur_frt.execute("INSERT INTO user_tag_follows(user_key,tag,created_at) VALUES(%s,%s,NOW()) ON CONFLICT DO NOTHING",(user_key,tag))
+                action='followed'
+            conn_frt.commit()
+            return {'status':200,'action':action}
+        finally: release_conn(conn_frt)
+
+    elif status == 'get_university_feed':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        conn_uf = get_conn()
+        try:
+            cur_uf = conn_uf.cursor(cursor_factory=RealDictCursor)
+            cur_uf.execute("SELECT university,department FROM user_auth WHERE user_key=%s",(user_key,))
+            me = cur_uf.fetchone()
+            if not me or not me.get('university'): return {'status':400,'message':'No university set'}
+            filter_type = x.get('filter','university')
+            seen_keys = x.get('seen_keys',[]) or []
+            if filter_type == 'department' and me.get('department'):
+                cur_uf.execute("SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level,u.department,u.university FROM posts p JOIN user_auth u ON u.user_key=p.user_key WHERE u.department=%s AND p.visibility='public' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) ORDER BY p.created_at DESC LIMIT 20",(me['department'],seen_keys))
+            else:
+                cur_uf.execute("SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level,u.department,u.university FROM posts p JOIN user_auth u ON u.user_key=p.user_key WHERE u.university=%s AND p.visibility='public' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) ORDER BY p.created_at DESC LIMIT 20",(me['university'],seen_keys))
+            posts = cur_uf.fetchall()
+            return {'status':200,'posts':[dict(p) for p in posts],'university':me['university'],'department':me.get('department','')}
+        finally: release_conn(conn_uf)
+
+    elif status == 'expire_bounties':
+        conn_eb = get_conn()
+        try:
+            cur_eb = conn_eb.cursor()
+            cur_eb.execute("UPDATE posts SET show_in_feed=FALSE WHERE post_type='bounty' AND show_in_feed=TRUE AND post_key IN (SELECT post_key FROM post_extras WHERE (data->>'deadline') IS NOT NULL AND (data->>'deadline')::date < CURRENT_DATE)")
+            conn_eb.commit()
+            return {'status':200,'expired':cur_eb.rowcount}
+        finally: release_conn(conn_eb)
+
+
+    elif status == 'get_bounties':
+        conn_gb = get_conn()
+        try:
+            cur_gb = conn_gb.cursor(cursor_factory=RealDictCursor)
+            category  = x.get('category')
+            seen_keys = x.get('seen_keys') or []
+            if category:
+                cur_gb.execute(
+                    "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key LEFT JOIN post_extras pe ON pe.post_key=p.post_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) AND (pe.data->>'category')=%s ORDER BY p.created_at DESC LIMIT 20",
+                    (seen_keys, category)
+                )
+            else:
+                cur_gb.execute(
+                    "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) ORDER BY p.created_at DESC LIMIT 20",
+                    (seen_keys,)
+                )
+            posts = cur_gb.fetchall()
+            return {'status':200,'posts':[dict(p) for p in posts]}
+        finally: release_conn(conn_gb)
+
+    elif status == 'get_marketplace':
+        conn_gm = get_conn()
+        try:
+            cur_gm = conn_gm.cursor(cursor_factory=RealDictCursor)
+            category  = x.get('category')
+            sort_by   = x.get('sort','recent')
+            seen_keys = x.get('seen_keys') or []
+            sort_col  = 'p.created_at DESC'
+            if sort_by == 'price_asc':
+                sort_col = "(pe.data->>'price')::numeric ASC NULLS LAST"
+            elif sort_by == 'price_desc':
+                sort_col = "(pe.data->>'price')::numeric DESC NULLS LAST"
+            base_q = "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level,pe.data as extras FROM posts p JOIN user_auth u ON u.user_key=p.user_key LEFT JOIN post_extras pe ON pe.post_key=p.post_key WHERE p.post_type='product' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s)"
+            if category:
+                cur_gm.execute(base_q + " AND (pe.data->>'category')=%s ORDER BY " + sort_col + " LIMIT 30", (seen_keys, category))
+            else:
+                cur_gm.execute(base_q + " ORDER BY " + sort_col + " LIMIT 30", (seen_keys,))
+            posts = cur_gm.fetchall()
+            return {'status':200,'posts':[dict(p) for p in posts]}
+        finally: release_conn(conn_gm)
+
+    elif status == 'withdraw_application':
+        user_key = validate_session(token)
+        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
+        post_key = x.get('post_key')
+        conn_wa = get_conn()
+        try:
+            cur_wa = conn_wa.cursor()
+            cur_wa.execute("DELETE FROM post_applications WHERE applicant_key=%s AND post_key=%s AND note!='rsvp'",(user_key,post_key))
+            if cur_wa.rowcount == 0: return {'status':404,'message':'Application not found'}
+            conn_wa.commit()
+            return {'status':200,'message':'Application withdrawn'}
+        finally: release_conn(conn_wa)
+
+
+    elif status == 'forgot_password':
+        email = x.get('email','').lower().strip()
+        conn_fp = get_conn()
+        try:
+            cur_fp = conn_fp.cursor(cursor_factory=RealDictCursor)
+            cur_fp.execute("SELECT user_key FROM user_auth WHERE email=%s", (email,))
+            user = cur_fp.fetchone()
+            if not user:
+                return {'status':200,'message':'If that email exists, a reset link has been sent'}
+            import secrets, datetime
+            reset_token = secrets.token_urlsafe(32)
+            expires = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            cur_fp.execute("UPDATE user_auth SET reset_token=%s, reset_token_expires=%s WHERE user_key=%s",(reset_token,expires,user['user_key']))
+            conn_fp.commit()
+            # In production: send email with reset link
+            return {'status':200,'message':'Reset link sent'}
+        finally: release_conn(conn_fp)
+
     else:
         return {'status': 400, 'message': A.Genericerror}
 
 
 # ── Startup ───────────────────────────────────────────────────
-create_table()
+#create_table()
