@@ -6,41 +6,593 @@ import bcrypt
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from datetime import datetime
+from datetime import datetime, timedelta
 import Appmodulator as A
 
-def generate_feed_sequence(n):
-    sequence     = []
-    post_count   = 0
-    last_type    = None
-    streak       = 0
-    post_types   = ['text', 'image', 'video', 'poll', 'event']
+# ═══════════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════════
+_pool = None
 
+def get_pool():
+    global _pool
+    if _pool is None:
+        _pool = pool.ThreadedConnectionPool(
+            minconn=1, maxconn=10,
+            host=A.DB_HOST, database=A.DB_NAME,
+            user=A.DB_USER, password=A.DB_PASSWORD,
+            port=A.DB_PORT, sslmode='require'
+        )
+    return _pool
+
+def get_conn():
+    return get_pool().getconn()
+
+def release_conn(conn):
+    try:
+        get_pool().putconn(conn)
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════
+def gen_key():
+    return str(uuid.uuid4()).replace('-', '')
+
+def time_ago(dt):
+    if not dt:
+        return ''
+    try:
+        now = datetime.utcnow()
+        if hasattr(dt, 'tzinfo') and dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        diff = int((now - dt).total_seconds())
+        if diff < 60:      return 'just now'
+        if diff < 3600:    return f"{diff // 60}m ago"
+        if diff < 86400:   return f"{diff // 3600}h ago"
+        if diff < 604800:  return f"{diff // 86400}d ago"
+        if diff < 2592000: return f"{diff // 604800}w ago"
+        return dt.strftime('%b %d, %Y')
+    except Exception:
+        return ''
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def check_password(plain, hashed):
+    try:
+        return bcrypt.checkpw(plain.encode('utf-8'), hashed.encode('utf-8'))
+    except Exception:
+        return False
+
+# ═══════════════════════════════════════════════════════════════
+# USER HELPERS
+# ═══════════════════════════════════════════════════════════════
+def get_user_by_key(user_key):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM user_auth WHERE user_key = %s", (user_key,))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else {}
+    finally:
+        release_conn(conn)
+
+def update_last_seen(user_key):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_auth SET last_seen = NOW() WHERE user_key = %s", (user_key,))
+        conn.commit()
+        cur.close()
+    except Exception:
+        conn.rollback()
+    finally:
+        release_conn(conn)
+
+# ═══════════════════════════════════════════════════════════════
+# AUTH
+# ═══════════════════════════════════════════════════════════════
+def verify_signup_data(x):
+    email    = x.get('email', '').strip().lower()
+    username = x.get('username', '').strip().lower()
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT email, username FROM user_auth WHERE email=%s OR username=%s", (email, username))
+        rows = cur.fetchall()
+        cur.close()
+        if not rows:
+            return {'status': 200}
+        emails    = [r['email'] for r in rows]
+        usernames = [r['username'] for r in rows]
+        if email in emails and username in usernames:
+            return {'status': 400, 'error': 'both'}
+        if email in emails:
+            return {'status': 400, 'error': 'email'}
+        return {'status': 400, 'error': 'username'}
+    finally:
+        release_conn(conn)
+
+def verify_signin_data(x):
+    email    = x.get('email', '').strip().lower()
+    password = x.get('password', '')
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT user_key, password, is_deactivated FROM user_auth WHERE email = %s", (email,))
+        user = cur.fetchone()
+        cur.close()
+        if not user:
+            return {'status': 400, 'error': 'credentials'}
+        if user.get('is_deactivated'):
+            return {'status': 400, 'error': 'deactivated'}
+        if not check_password(password, user['password']):
+            return {'status': 400, 'error': 'credentials'}
+        return {'status': 200, 'user_key': user['user_key']}
+    finally:
+        release_conn(conn)
+
+def insert_user(x):
+    user_key = gen_key()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_auth (
+                user_key, full_name, username, email, password,
+                university, department, academic_level,
+                numberoffollowers, numberoffollowing, numberofposts, numberoflikes,
+                account_level, is_deactivated,
+                notif_likes, notif_comments, notif_follows, notif_mentions,
+                notif_messages, notif_events, notif_bounties, notif_email, notif_push,
+                show_activity_status, read_receipts, typing_indicators,
+                is_private, post_visibility, research_visibility,
+                message_privacy, tag_privacy, followers_list_visibility,
+                created_at
+            ) VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,
+                0,0,0,0,'free',FALSE,
+                TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,FALSE,TRUE,
+                TRUE,TRUE,TRUE,FALSE,'public','public','everyone','everyone','everyone',
+                NOW()
+            )
+        """, (
+            user_key,
+            x.get('full_name', '').strip(),
+            x.get('username', '').strip().lower(),
+            x.get('email', '').strip().lower(),
+            hash_password(x.get('password', '')),
+            x.get('university', '').strip(),
+            x.get('department', '').strip(),
+            x.get('academic_level', '').strip(),
+        ))
+        conn.commit()
+        cur.close()
+        return user_key
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+def create_session(user_key, device_info=''):
+    token      = gen_key()
+    expires_at = datetime.utcnow() + timedelta(days=A.SESSION_DURATION_DAYS)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO sessions (session_key, user_key, device_info, expires_at, created_at)
+            VALUES (%s,%s,%s,%s,NOW())
+        """, (token, user_key, (device_info or '')[:200], expires_at))
+        conn.commit()
+        cur.close()
+        return token
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+def validate_session(token):
+    if not token:
+        return None
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT s.user_key FROM sessions s
+            JOIN user_auth u ON u.user_key = s.user_key
+            WHERE s.session_key = %s AND s.expires_at > NOW() AND u.is_deactivated = FALSE
+        """, (token,))
+        row = cur.fetchone()
+        cur.close()
+        return row['user_key'] if row else None
+    except Exception:
+        return None
+    finally:
+        release_conn(conn)
+
+def logout(token):
+    if not token:
+        return {'status': 200}
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE session_key = %s", (token,))
+        conn.commit()
+        cur.close()
+        return {'status': 200, 'message': 'Logged out.'}
+    except Exception:
+        conn.rollback()
+        return {'status': 200}
+    finally:
+        release_conn(conn)
+
+def deactivate_account(x, token):
+    user_key = validate_session(token)
+    if not user_key:
+        return {'status': 401, 'message': A.Unauthorizedmessage}
+    user = get_user_by_key(user_key)
+    if not check_password(x.get('password', ''), user['password']):
+        return {'status': 400, 'message': A.Incorrectpasswordmessage}
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_auth SET is_deactivated=TRUE WHERE user_key=%s", (user_key,))
+        cur.execute("DELETE FROM sessions WHERE user_key=%s", (user_key,))
+        conn.commit()
+        cur.close()
+        return {'status': 200, 'message': A.Accountdeactivatesuccessmsg}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+def delete_account(x, token):
+    user_key = validate_session(token)
+    if not user_key:
+        return {'status': 401, 'message': A.Unauthorizedmessage}
+    user = get_user_by_key(user_key)
+    if not check_password(x.get('password', ''), user['password']):
+        return {'status': 400, 'message': A.Incorrectpasswordmessage}
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE user_key=%s", (user_key,))
+        cur.execute("DELETE FROM user_auth WHERE user_key=%s", (user_key,))
+        conn.commit()
+        cur.close()
+        return {'status': 200, 'message': A.Accountdeletesuccessmsg}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+def update_avatar(x, token):
+    user_key = validate_session(token)
+    if not user_key:
+        return {'status': 401, 'message': A.Unauthorizedmessage}
+    data_url = x.get('avatar', '')
+    if not data_url:
+        return {'status': 400, 'message': 'No image provided.'}
+    url = upload_to_cloudinary(data_url, 'image')
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_auth SET profilepicurl=%s WHERE user_key=%s", (url, user_key))
+        conn.commit()
+        cur.close()
+        return {'status': 200, 'message': A.Avatarupdatesuccessmessage, 'avatar': url}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+def remove_avatar(token):
+    user_key = validate_session(token)
+    if not user_key:
+        return {'status': 401, 'message': A.Unauthorizedmessage}
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_auth SET profilepicurl=NULL WHERE user_key=%s", (user_key,))
+        conn.commit()
+        cur.close()
+        return {'status': 200, 'message': A.Avatarremovesuccessmessage, 'avatar': ''}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+# ═══════════════════════════════════════════════════════════════
+# PROFILE HELPERS
+# ═══════════════════════════════════════════════════════════════
+def get_avatar_html(user):
+    pic      = user.get('profilepicurl') or ''
+    name     = user.get('full_name') or ''
+    initials = ''.join([p[0].upper() for p in name.split()[:2]]) if name else '?'
+    if pic:
+        return f'<img src="{pic}" id="avatar" class="avatar" style="display:block;">'
+    return f'<span id="avatarInitials" class="avatar-initials">{initials}</span>'
+
+def profileinfo(user):
+    name     = user.get('full_name', '')
+    username = user.get('username', '')
+    dept     = user.get('department', '')
+    uni      = user.get('university', '')
+    level    = user.get('academic_level', '')
+    parts    = [f'@{username}', dept, level, uni]
+    handle   = ' &bull; '.join(p for p in parts if p)
+    bio      = user.get('biodescription') or A.defaultbiodescription
+    return f'''
+        <div id="profileName" class="name">{name}</div>
+        <div id="profileHandle" class="handle">{handle}</div>
+        <div id="profileBio" class="bio">{bio}</div>
+    '''
+
+def profilestats(user):
+    def fmt(n):
+        n = n or 0
+        if n >= 1000000: return f"{n/1000000:.1f}M"
+        if n >= 1000:    return f"{n/1000:.1f}K"
+        return str(n)
+    return f'''
+        <div class="stat"><div class="stat-num" id="statFollowing">{fmt(user.get('numberoffollowing',0))}</div><div class="stat-label">Following</div></div>
+        <div class="stat"><div class="stat-num" id="statFollowers">{fmt(user.get('numberoffollowers',0))}</div><div class="stat-label">Followers</div></div>
+        <div class="stat"><div class="stat-num" id="statLikes">{fmt(user.get('numberoflikes',0))}</div><div class="stat-label">Likes</div></div>
+        <div class="stat"><div class="stat-num" id="statPosts">{fmt(user.get('numberofposts',0))}</div><div class="stat-label">Posts</div></div>
+    '''
+
+def drawerprofilenav(user):
+    pic      = user.get('profilepicurl') or ''
+    name     = user.get('full_name', '')
+    username = user.get('username', '')
+    initials = ''.join([p[0].upper() for p in name.split()[:2]]) if name else '?'
+    av = (f'<img src="{pic}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;">'
+          if pic else
+          f'<div style="width:40px;height:40px;border-radius:50%;background:#1a1a1a;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff;">{initials}</div>')
+    return f'''<div style="display:flex;align-items:center;gap:12px;">
+        {av}
+        <div>
+            <div style="font-weight:700;font-size:14px;">{name}</div>
+            <div style="font-size:12px;color:#555;">@{username}</div>
+        </div>
+    </div>'''
+
+def settings_payload(user):
+    username = user.get('username', '')
+    dept     = user.get('department', '')
+    uni      = user.get('university', '')
+    return {
+        'setProfileName':   user.get('full_name', ''),
+        'setProfileHandle': f"@{username} &bull; {dept} &bull; {uni}",
+        'setUsername':      username,
+        'setEmail':         user.get('email', ''),
+        'setBio':           user.get('biodescription', '') or '',
+        'setUniversity':    uni,
+        'setDepartment':    dept,
+        'setAcademicLevel': user.get('academic_level', ''),
+        'setFullName':      user.get('full_name', ''),
+        'accountLevel':     user.get('account_level', 'free'),
+        'user_key':         user.get('user_key', ''),
+    }
+
+def get_followers(user_key):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT u.user_key, u.full_name, u.username, u.profilepicurl,
+                   u.department, u.university, u.account_level
+            FROM user_auth u JOIN follows f ON f.follower_key = u.user_key
+            WHERE f.following_key = %s ORDER BY f.created_at DESC
+        """, (user_key,))
+        rows = cur.fetchall()
+        cur.close()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
+
+def get_following(user_key):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT u.user_key, u.full_name, u.username, u.profilepicurl,
+                   u.department, u.university, u.account_level
+            FROM user_auth u JOIN follows f ON f.following_key = u.user_key
+            WHERE f.follower_key = %s ORDER BY f.created_at DESC
+        """, (user_key,))
+        rows = cur.fetchall()
+        cur.close()
+        return [dict(r) for r in rows]
+    finally:
+        release_conn(conn)
+
+def build_user_list_html(users, viewer_key=''):
+    if not users:
+        return A.nofollowingorfollowersgeneral
+    html = ''
+    for u in users:
+        pic      = u.get('profilepicurl') or ''
+        name     = u.get('full_name', '')
+        username = u.get('username', '')
+        dept     = u.get('department', '')
+        initials = ''.join([p[0].upper() for p in name.split()[:2]]) if name else '?'
+        av = (f'<img src="{pic}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;border:1px solid #333;">'
+              if pic else
+              f'<div style="width:44px;height:44px;border-radius:50%;background:#1a1a1a;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;color:#fff;">{initials}</div>')
+        html += f'''<div class="user-item" onclick="viewProfile('{u['user_key']}')">
+            {av}
+            <div class="user-item-info">
+                <div class="user-item-name">{name}</div>
+                <div class="user-item-handle">@{username}</div>
+                <div class="user-item-dept">{dept}</div>
+            </div>
+            <button class="user-follow-btn" onclick="event.stopPropagation();toggleFollow('{u['user_key']}',this)">Follow</button>
+        </div>'''
+    return html
+
+def get_user_posts(user_key, tab='posts', seen_keys=None):
+    seen_keys = seen_keys or []
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        if tab == 'saved':
+            cur.execute("""
+                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                       pe.data as extras, TRUE as is_bookmarked,
+                       EXISTS(SELECT 1 FROM likes l WHERE l.post_key=p.post_key AND l.user_key=%s) as is_liked,
+                       EXISTS(SELECT 1 FROM follows f WHERE f.follower_key=%s AND f.following_key=p.user_key) as is_following
+                FROM bookmarks b JOIN posts p ON p.post_key = b.post_key
+                JOIN user_auth u ON u.user_key = p.user_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+                WHERE b.user_key = %s AND p.post_key != ALL(%s)
+                ORDER BY b.created_at DESC LIMIT 20
+            """, (user_key, user_key, user_key, seen_keys))
+        elif tab == 'research':
+            cur.execute("""
+                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                       pe.data as extras,
+                       EXISTS(SELECT 1 FROM likes l WHERE l.post_key=p.post_key AND l.user_key=%s) as is_liked,
+                       EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key=p.post_key AND bk.user_key=%s) as is_bookmarked,
+                       FALSE as is_following
+                FROM posts p JOIN user_auth u ON u.user_key = p.user_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+                WHERE p.user_key = %s AND p.post_type = 'research' AND p.post_key != ALL(%s)
+                ORDER BY p.created_at DESC LIMIT 20
+            """, (user_key, user_key, user_key, seen_keys))
+        else:
+            cur.execute("""
+                SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                       pe.data as extras,
+                       EXISTS(SELECT 1 FROM likes l WHERE l.post_key=p.post_key AND l.user_key=%s) as is_liked,
+                       EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key=p.post_key AND bk.user_key=%s) as is_bookmarked,
+                       FALSE as is_following
+                FROM posts p JOIN user_auth u ON u.user_key = p.user_key
+                LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+                WHERE p.user_key = %s AND p.post_key != ALL(%s)
+                ORDER BY p.is_pinned DESC NULLS LAST, p.created_at DESC LIMIT 20
+            """, (user_key, user_key, user_key, seen_keys))
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for r in rows:
+            p = dict(r)
+            p['time_ago'] = time_ago(p.get('created_at'))
+            if p.get('extras') is None:
+                p['extras'] = {}
+            result.append(p)
+        return result
+    finally:
+        release_conn(conn)
+
+def get_post(post_key, user_key=None):
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level,
+                   pe.data as extras,
+                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key=p.post_key AND l.user_key=%s) as is_liked,
+                   EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key=p.post_key AND bk.user_key=%s) as is_bookmarked,
+                   EXISTS(SELECT 1 FROM follows f WHERE f.follower_key=%s AND f.following_key=p.user_key) as is_following
+            FROM posts p JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+            WHERE p.post_key = %s
+        """, (user_key, user_key, user_key, post_key))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        p = dict(row)
+        p['time_ago'] = time_ago(p.get('created_at'))
+        if p.get('extras') is None:
+            p['extras'] = {}
+        return p
+    finally:
+        release_conn(conn)
+
+def get_global_research(seen_keys=None):
+    seen_keys = seen_keys or []
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level, pe.data as extras
+            FROM posts p JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+            WHERE p.post_type = 'research' AND p.visibility = 'public'
+            AND p.show_in_feed = TRUE AND p.post_key != ALL(%s)
+            ORDER BY p.created_at DESC LIMIT 20
+        """, (seen_keys,))
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for r in rows:
+            p = dict(r)
+            p['time_ago'] = time_ago(p.get('created_at'))
+            if p.get('extras') is None:
+                p['extras'] = {}
+            result.append(p)
+        return result
+    finally:
+        release_conn(conn)
+
+def get_announcements():
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM announcements ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for r in rows:
+            a = dict(r)
+            a['time_ago'] = time_ago(a.get('created_at'))
+            result.append(a)
+        return result
+    except Exception:
+        return []
+    finally:
+        release_conn(conn)
+
+# ═══════════════════════════════════════════════════════════════
+# FEED
+# ═══════════════════════════════════════════════════════════════
+def generate_feed_sequence(n):
+    sequence   = []
+    post_count = 0
+    last_type  = None
+    streak     = 0
+    post_types = ['text', 'image', 'video', 'poll', 'event']
     for i in range(n):
         if post_count > 0 and post_count % A.TRENDING_FREQUENCY == 0:
             sequence.append('trending_now')
-
         if post_count > 0 and post_count % A.SUGGESTION_FREQUENCY == 0:
             if sequence and sequence[-1] == 'trending_now':
                 sequence.insert(-1, 'suggestions')
             else:
                 sequence.append('suggestions')
-
         if post_count > 0 and post_count % A.AD_FREQUENCY == 0:
             sequence.append('ad')
-
         available = post_types if streak < A.MAX_SAME_TYPE_IN_ROW else [t for t in post_types if t != last_type]
         chosen    = random.choice(available)
-
         if chosen == last_type:
             streak += 1
         else:
             streak    = 1
             last_type = chosen
-
         sequence.append(chosen)
         post_count += 1
-
     return sequence
 
 def score_post(post, user, following_keys):
@@ -48,26 +600,19 @@ def score_post(post, user, following_keys):
     score += post.get('like_count', 0)    * A.SCORE_LIKE
     score += post.get('comment_count', 0) * A.SCORE_COMMENT
     score += post.get('share_count', 0)   * A.SCORE_SHARE
-
-    if post.get('university') == user.get('university'):
-        score += A.SCORE_UNIVERSITY
-    if post.get('department') == user.get('department'):
-        score += A.SCORE_DEPARTMENT
-    if post.get('academic_level') == user.get('academic_level'):
-        score += A.SCORE_ACADEMIC_LEVEL
-    if post.get('user_key') in following_keys:
-        score += A.SCORE_FOLLOWING
-
+    if post.get('university') == user.get('university'):   score += A.SCORE_UNIVERSITY
+    if post.get('department') == user.get('department'):   score += A.SCORE_DEPARTMENT
+    if post.get('academic_level') == user.get('academic_level'): score += A.SCORE_ACADEMIC_LEVEL
+    if post.get('user_key') in following_keys:             score += A.SCORE_FOLLOWING
     created_at = post.get('created_at')
     if created_at:
-        diff_seconds = (datetime.utcnow() - created_at).total_seconds()
-        if diff_seconds < 3600:
-            score += A.SCORE_RECENCY_1HR
-        elif diff_seconds < 21600:
-            score += A.SCORE_RECENCY_6HR
-        elif diff_seconds < 86400:
-            score += A.SCORE_RECENCY_24HR
-
+        try:
+            diff = (datetime.utcnow() - created_at.replace(tzinfo=None)).total_seconds()
+            if diff < 3600:    score += A.SCORE_RECENCY_1HR
+            elif diff < 21600: score += A.SCORE_RECENCY_6HR
+            elif diff < 86400: score += A.SCORE_RECENCY_24HR
+        except Exception:
+            pass
     return score
 
 def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
@@ -77,67 +622,49 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
     conn      = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-
         cur.execute("SELECT following_key FROM follows WHERE follower_key = %s", (user_key,))
         following_keys = {row['following_key'] for row in cur.fetchall()}
-
-        # Build type filter clause
         if type_filter and type_filter != 'all':
             type_clause = "AND p.post_type = %s"
         else:
             type_clause = ""
             type_filter = None
-
         if type_filter:
             params = (user_key, user_key, user_key, user_key, seen_keys, type_filter, n * 3)
         else:
             params = (user_key, user_key, user_key, user_key, seen_keys, n * 3)
-
         cur.execute(f"""
             SELECT p.*, u.full_name, u.username, u.profilepicurl,
                    u.university, u.department, u.academic_level, u.account_level,
                    pe.data as extras,
                    EXISTS(SELECT 1 FROM likes l WHERE l.post_key = p.post_key AND l.user_key = %s) as is_liked,
                    EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key = p.post_key AND bk.user_key = %s) as is_bookmarked,
-       EXISTS(SELECT 1 FROM follows f WHERE f.follower_key = %s AND f.following_key = p.user_key) as is_following
+                   EXISTS(SELECT 1 FROM follows f WHERE f.follower_key = %s AND f.following_key = p.user_key) as is_following
             FROM posts p
             JOIN user_auth u ON u.user_key = p.user_key
             LEFT JOIN blocks b ON (b.blocker_key = %s AND b.blocked_key = p.user_key)
             LEFT JOIN post_extras pe ON pe.post_key = p.post_key
             WHERE p.post_key != ALL(%s)
-            AND p.show_in_feed = TRUE
-            AND p.visibility = 'public'
+            AND p.show_in_feed = TRUE AND p.visibility = 'public'
             AND b.blocker_key IS NULL
             {type_clause}
-            ORDER BY p.created_at DESC
-            LIMIT %s
+            ORDER BY p.created_at DESC LIMIT %s
         """, params)
         posts = [dict(p) for p in cur.fetchall()]
         cur.close()
-
-        contextualized = []
-        random_posts   = []
-
         for post in posts:
-            post['score'] = score_post(post, user, following_keys)
+            post['score']    = score_post(post, user, following_keys)
             post['time_ago'] = time_ago(post.get('created_at'))
             if post.get('extras') is None:
                 post['extras'] = {}
-
         posts.sort(key=lambda p: p['score'], reverse=True)
-
-        split         = int(n * 0.7)
+        split          = int(n * 0.7)
         contextualized = posts[:split]
         remaining      = posts[split:]
         random.shuffle(remaining)
         random_posts   = remaining[:n - split]
-
-        final = contextualized + random_posts
         random.shuffle(random_posts)
-        final = contextualized + random_posts
-        final = final[:n]
-
-        return final
+        return (contextualized + random_posts)[:n]
     finally:
         release_conn(conn)
 
@@ -148,20 +675,14 @@ def get_suggestions(user_key, limit=5):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT u.user_key, u.full_name, u.username, u.profilepicurl,
-                   u.department, u.university, u.account_level,
-                   u.numberoffollowers
+                   u.department, u.university, u.account_level, u.numberoffollowers
             FROM user_auth u
-            WHERE u.user_key != %s
-            AND u.is_deactivated = FALSE
-            AND u.user_key NOT IN (
-                SELECT following_key FROM follows WHERE follower_key = %s
-            )
-            AND u.user_key NOT IN (
-                SELECT blocked_key FROM blocks WHERE blocker_key = %s
-            )
+            WHERE u.user_key != %s AND u.is_deactivated = FALSE
+            AND u.user_key NOT IN (SELECT following_key FROM follows WHERE follower_key=%s)
+            AND u.user_key NOT IN (SELECT blocked_key FROM blocks WHERE blocker_key=%s)
             ORDER BY
-                CASE WHEN u.university = %s THEN 0 ELSE 1 END,
-                CASE WHEN u.department = %s THEN 0 ELSE 1 END,
+                CASE WHEN u.university=%s THEN 0 ELSE 1 END,
+                CASE WHEN u.department=%s THEN 0 ELSE 1 END,
                 u.numberoffollowers DESC
             LIMIT %s
         """, (user_key, user_key, user_key,
@@ -180,10 +701,9 @@ def build_suggestions_html(users):
         pic      = u.get('profilepicurl') or ''
         initials = ''.join([p[0].upper() for p in u['full_name'].split()[:2]])
         tick     = ' ✓' if u.get('account_level') == 'premium' else ''
+        av       = f"<img src='{pic}' class='suggestion-avatar'>" if pic else f"<div class='suggestion-avatar-initials'>{initials}</div>"
         html += f'''<div class="suggestion-card">
-  <div class="suggestion-avatar-wrap">
-    {"<img src='"+pic+"' class='suggestion-avatar'>" if pic else f"<div class='suggestion-avatar-initials'>{initials}</div>"}
-  </div>
+  <div class="suggestion-avatar-wrap">{av}</div>
   <div class="suggestion-name">{u["full_name"]}{tick}</div>
   <div class="suggestion-dept">{u.get("department","")}</div>
   <div class="suggestion-uni">{u.get("university","")}</div>
@@ -196,20 +716,15 @@ def get_trending_topics(limit=10):
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT content FROM posts
-            WHERE created_at > NOW() - INTERVAL '24 hours'
-            AND visibility = 'public'
-        """)
+        cur.execute("SELECT content FROM posts WHERE created_at > NOW() - INTERVAL '24 hours' AND visibility = 'public'")
         posts     = cur.fetchall()
         cur.close()
-        stopwords = {'the','a','an','is','are','was','were','i','you','we','they',
-                     'it','he','she','and','or','but','in','on','at','to','for',
-                     'of','with','this','that','be','have','do','not','my','your'}
+        stopwords = {'the','a','an','is','are','was','were','i','you','we','they','it','he','she',
+                     'and','or','but','in','on','at','to','for','of','with','this','that','be',
+                     'have','do','not','my','your'}
         freq = {}
         for post in posts:
-            words = post['content'].lower().split()
-            for word in words:
+            for word in (post['content'] or '').lower().split():
                 word = word.strip('.,!?#@()[]{}":;')
                 if len(word) > 2 and word not in stopwords:
                     freq[word] = freq.get(word, 0) + 1
@@ -231,16 +746,12 @@ def get_ad():
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT * FROM ads WHERE active = TRUE
-            ORDER BY RANDOM() LIMIT 1
-        """)
+        cur.execute("SELECT * FROM ads WHERE active = TRUE ORDER BY RANDOM() LIMIT 1")
         ad = cur.fetchone()
         cur.close()
         return dict(ad) if ad else None
     finally:
         release_conn(conn)
-
 
 # ═══════════════════════════════════════════════════════════════
 # SOCIAL ACTIONS
@@ -250,7 +761,6 @@ def toggle_like(x, token):
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
     post_key = x.get('post_key')
-    # Prevent self-like
     c0 = get_conn()
     try:
         r0 = c0.cursor(cursor_factory=RealDictCursor)
@@ -270,23 +780,16 @@ def toggle_like(x, token):
             cur.execute("UPDATE posts SET like_count = like_count - 1 WHERE post_key=%s", (post_key,))
             action = A.Unlikedmessage
         else:
-            cur.execute("INSERT INTO likes (like_key, post_key, user_key) VALUES (%s,%s,%s)",
-                        (gen_key(), post_key, user_key))
+            cur.execute("INSERT INTO likes (like_key, post_key, user_key) VALUES (%s,%s,%s)", (gen_key(), post_key, user_key))
             cur.execute("UPDATE posts SET like_count = like_count + 1 WHERE post_key=%s", (post_key,))
             action = A.Likedmessage
-            push_notification(
-                recipient_key=get_post_owner(post_key),
-                sender_key=user_key,
-                notif_type='like',
-                post_key=post_key,
-                message=''
-            )
+            push_notification(get_post_owner(post_key), user_key, 'like', post_key, '')
         cur.execute("SELECT like_count FROM posts WHERE post_key=%s", (post_key,))
         count = cur.fetchone()[0]
         conn.commit()
         cur.close()
         return {'status': 200, 'action': action, 'like_count': count}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -304,31 +807,17 @@ def post_comment(x, token):
     try:
         cur         = conn.cursor()
         comment_key = gen_key()
-        cur.execute("""
-            INSERT INTO comments (comment_key, post_key, user_key, content)
-            VALUES (%s,%s,%s,%s)
-        """, (comment_key, post_key, user_key, content))
+        cur.execute("INSERT INTO comments (comment_key, post_key, user_key, content) VALUES (%s,%s,%s,%s)",
+                    (comment_key, post_key, user_key, content))
         cur.execute("UPDATE posts SET comment_count = comment_count + 1 WHERE post_key=%s", (post_key,))
-        push_notification(
-            recipient_key=get_post_owner(post_key),
-            sender_key=user_key,
-            notif_type='comment',
-            post_key=post_key,
-            message=content[:100]
-        )
+        push_notification(get_post_owner(post_key), user_key, 'comment', post_key, content[:100])
         conn.commit()
         cur.close()
         user = get_user_by_key(user_key)
-        return {
-            'status': 200,
-            'message': A.Commentsuccessmessage,
-            'comment_key': comment_key,
-            'full_name': user['full_name'],
-            'profilepicurl': user.get('profilepicurl', ''),
-            'time_ago': 'Just now',
-            'content': content
-        }
-    except Exception as e:
+        return {'status': 200, 'message': A.Commentsuccessmessage, 'comment_key': comment_key,
+                'full_name': user['full_name'], 'profilepicurl': user.get('profilepicurl', ''),
+                'time_ago': 'Just now', 'content': content}
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -341,10 +830,8 @@ def get_comments(x):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT c.*, u.full_name, u.username, u.profilepicurl, u.account_level
-            FROM comments c
-            JOIN user_auth u ON u.user_key = c.user_key
-            WHERE c.post_key = %s
-            ORDER BY c.created_at ASC
+            FROM comments c JOIN user_auth u ON u.user_key = c.user_key
+            WHERE c.post_key = %s ORDER BY c.created_at ASC
         """, (post_key,))
         rows = cur.fetchall()
         cur.close()
@@ -353,7 +840,7 @@ def get_comments(x):
         release_conn(conn)
 
 def delete_comment(x, token):
-    user_key    = validate_session(token)
+    user_key = validate_session(token)
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
     comment_key = x.get('comment_key')
@@ -371,7 +858,7 @@ def delete_comment(x, token):
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Commentdeletedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -386,8 +873,7 @@ def toggle_bookmark(x, token):
     try:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM bookmarks WHERE post_key=%s AND user_key=%s", (post_key, user_key))
-        exists = cur.fetchone()
-        if exists:
+        if cur.fetchone():
             cur.execute("DELETE FROM bookmarks WHERE post_key=%s AND user_key=%s", (post_key, user_key))
             action = A.Unbookmarkedmessage
         else:
@@ -397,7 +883,7 @@ def toggle_bookmark(x, token):
         conn.commit()
         cur.close()
         return {'status': 200, 'action': action}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -413,12 +899,10 @@ def toggle_follow(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM follows WHERE follower_key=%s AND following_key=%s",
-                    (user_key, target_key))
+        cur.execute("SELECT 1 FROM follows WHERE follower_key=%s AND following_key=%s", (user_key, target_key))
         exists = cur.fetchone()
         if exists:
-            cur.execute("DELETE FROM follows WHERE follower_key=%s AND following_key=%s",
-                        (user_key, target_key))
+            cur.execute("DELETE FROM follows WHERE follower_key=%s AND following_key=%s", (user_key, target_key))
             cur.execute("UPDATE user_auth SET numberoffollowing = numberoffollowing - 1 WHERE user_key=%s", (user_key,))
             cur.execute("UPDATE user_auth SET numberoffollowers = numberoffollowers - 1 WHERE user_key=%s", (target_key,))
             action = A.Unfollowedmessage
@@ -428,17 +912,11 @@ def toggle_follow(x, token):
             cur.execute("UPDATE user_auth SET numberoffollowing = numberoffollowing + 1 WHERE user_key=%s", (user_key,))
             cur.execute("UPDATE user_auth SET numberoffollowers = numberoffollowers + 1 WHERE user_key=%s", (target_key,))
             action = A.Followedmessage
-            push_notification(
-                recipient_key=target_key,
-                sender_key=user_key,
-                notif_type='follow',
-                post_key='',
-                message=''
-            )
+            push_notification(target_key, user_key, 'follow', '', '')
         conn.commit()
         cur.close()
         return {'status': 200, 'action': action}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -452,17 +930,14 @@ def toggle_block(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM blocks WHERE blocker_key=%s AND blocked_key=%s",
-                    (user_key, target_key))
+        cur.execute("SELECT 1 FROM blocks WHERE blocker_key=%s AND blocked_key=%s", (user_key, target_key))
         exists = cur.fetchone()
         if exists:
-            cur.execute("DELETE FROM blocks WHERE blocker_key=%s AND blocked_key=%s",
-                        (user_key, target_key))
+            cur.execute("DELETE FROM blocks WHERE blocker_key=%s AND blocked_key=%s", (user_key, target_key))
             action = A.Unblockedmessage
         else:
             cur.execute("INSERT INTO blocks (block_key, blocker_key, blocked_key) VALUES (%s,%s,%s)",
                         (gen_key(), user_key, target_key))
-            # auto-unfollow both directions
             cur.execute("DELETE FROM follows WHERE (follower_key=%s AND following_key=%s) OR (follower_key=%s AND following_key=%s)",
                         (user_key, target_key, target_key, user_key))
             cur.execute("UPDATE user_auth SET numberoffollowing = (SELECT COUNT(*) FROM follows WHERE follower_key=user_auth.user_key) WHERE user_key IN (%s,%s)",
@@ -473,7 +948,7 @@ def toggle_block(x, token):
         conn.commit()
         cur.close()
         return {'status': 200, 'action': action}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -488,8 +963,7 @@ def vote_poll(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT 1 FROM poll_votes WHERE post_key=%s AND user_key=%s",
-                    (post_key, user_key))
+        cur.execute("SELECT 1 FROM poll_votes WHERE post_key=%s AND user_key=%s", (post_key, user_key))
         if cur.fetchone():
             return {'status': 400, 'message': 'Already voted.'}
         cur.execute("INSERT INTO poll_votes (vote_key, post_key, user_key, option_index) VALUES (%s,%s,%s,%s)",
@@ -501,19 +975,16 @@ def vote_poll(x, token):
         total_votes = data.get('total_votes', 0) + 1
         if option_index < len(options):
             options[option_index]['votes'] = options[option_index].get('votes', 0) + 1
-        data['total_votes'] = total_votes
+        data['total_votes']  = total_votes
         data['poll_options'] = options
-        cur.execute("UPDATE post_extras SET data=%s WHERE post_key=%s",
-                    (json.dumps(data), post_key))
+        cur.execute("UPDATE post_extras SET data=%s WHERE post_key=%s", (json.dumps(data), post_key))
         conn.commit()
-        percentages = []
-        for opt in options:
-            pct = round((opt.get('votes', 0) / total_votes) * 100) if total_votes > 0 else 0
-            percentages.append({'text': opt['text'], 'pct': pct, 'votes': opt.get('votes', 0)})
+        percentages = [{'text': o['text'],
+                        'pct': round((o.get('votes', 0) / total_votes) * 100) if total_votes > 0 else 0,
+                        'votes': o.get('votes', 0)} for o in options]
         cur.close()
-        return {'status': 200, 'message': A.Votedmessage,
-                'percentages': percentages, 'total_votes': total_votes}
-    except Exception as e:
+        return {'status': 200, 'message': A.Votedmessage, 'percentages': percentages, 'total_votes': total_votes}
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -530,13 +1001,12 @@ def rsvp_event(x, token):
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO event_rsvps (rsvp_key, post_key, user_key, rsvp_status)
-            VALUES (%s,%s,%s,%s)
-            ON CONFLICT (post_key, user_key) DO UPDATE SET rsvp_status=%s
+            VALUES (%s,%s,%s,%s) ON CONFLICT (post_key, user_key) DO UPDATE SET rsvp_status=%s
         """, (gen_key(), post_key, user_key, rsvp_status, rsvp_status))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.RSVPmessage, 'rsvp_status': rsvp_status}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -551,25 +1021,16 @@ def apply_bounty(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM bounty_applications WHERE post_key=%s AND user_key=%s",
-                    (post_key, user_key))
+        cur.execute("SELECT 1 FROM bounty_applications WHERE post_key=%s AND user_key=%s", (post_key, user_key))
         if cur.fetchone():
             return {'status': 400, 'message': 'Already applied.'}
-        cur.execute("""
-            INSERT INTO bounty_applications (app_key, post_key, user_key, message)
-            VALUES (%s,%s,%s,%s)
-        """, (gen_key(), post_key, user_key, message))
-        push_notification(
-            recipient_key=get_post_owner(post_key),
-            sender_key=user_key,
-            notif_type='bounty_apply',
-            post_key=post_key,
-            message=message[:100]
-        )
+        cur.execute("INSERT INTO bounty_applications (app_key, post_key, user_key, message) VALUES (%s,%s,%s,%s)",
+                    (gen_key(), post_key, user_key, message))
+        push_notification(get_post_owner(post_key), user_key, 'bounty_apply', post_key, message[:100])
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Appliedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -586,7 +1047,6 @@ def get_post_owner(post_key):
     finally:
         release_conn(conn)
 
-
 # ═══════════════════════════════════════════════════════════════
 # CREATE POST
 # ═══════════════════════════════════════════════════════════════
@@ -594,11 +1054,9 @@ def upload_to_cloudinary(data_url, resource_type='image'):
     try:
         import cloudinary
         import cloudinary.uploader
-        cloudinary.config(
-            cloud_name = A.CLOUDINARY_CLOUD_NAME,
-            api_key    = A.CLOUDINARY_API_KEY,
-            api_secret = A.CLOUDINARY_API_SECRET
-        )
+        cloudinary.config(cloud_name=A.CLOUDINARY_CLOUD_NAME,
+                          api_key=A.CLOUDINARY_API_KEY,
+                          api_secret=A.CLOUDINARY_API_SECRET)
         result = cloudinary.uploader.upload(data_url, resource_type=resource_type, folder='trends_posts')
         return result.get('secure_url', '')
     except Exception as e:
@@ -609,25 +1067,23 @@ def create_post(x, token):
     user_key = validate_session(token)
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
-    # Validate post types
     import datetime as _dtv
-    _ptype = x.get('type','text')
+    _ptype = x.get('type', 'text')
     if _ptype == 'event':
-        _ed = (x.get('event') or {}).get('date','')
+        _ed = (x.get('event') or {}).get('date', '')
         if _ed:
             try:
-                if _dtv.datetime.strptime(_ed,'%Y-%m-%d').date() < _dtv.date.today():
-                    return {'status':400,'message':'Event date must be in the future'}
+                if _dtv.datetime.strptime(_ed, '%Y-%m-%d').date() < _dtv.date.today():
+                    return {'status': 400, 'message': 'Event date must be in the future'}
             except: pass
     if _ptype == 'bounty':
         try:
-            if float((x.get('bounty') or {}).get('amount',0) or 0) <= 0:
-                return {'status':400,'message':'Bounty reward must be greater than 0'}
+            if float((x.get('bounty') or {}).get('amount', 0) or 0) <= 0:
+                return {'status': 400, 'message': 'Bounty reward must be greater than 0'}
         except: pass
     if _ptype == 'research':
-        if not (x.get('research') or {}).get('title','').strip():
-            return {'status':400,'message':'Research post requires a title'}
-
+        if not (x.get('research') or {}).get('title', '').strip():
+            return {'status': 400, 'message': 'Research post requires a title'}
     post_key       = gen_key()
     post_type      = x.get('type', 'text')
     content        = x.get('content', '').strip()
@@ -636,58 +1092,40 @@ def create_post(x, token):
     visibility     = x.get('visibility', 'public')
     allow_comments = x.get('allowComments', True)
     show_in_feed   = x.get('showInFeed', True)
-
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO posts
-              (post_key, user_key, post_type, content, media_url, media_type,
-               visibility, allow_comments, show_in_feed)
+            INSERT INTO posts (post_key, user_key, post_type, content, media_url, media_type,
+                               visibility, allow_comments, show_in_feed)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (post_key, user_key, post_type, content, media_url, media_type,
               visibility, allow_comments, show_in_feed))
-
         hashtags = x.get('hashtags', [])
-
         extras = {}
-        if post_type == 'poll':
-            extras = {'poll_options': [{'text': o, 'votes': 0} for o in x.get('pollOptions', [])],
-                      'total_votes': 0}
-        elif post_type == 'research':
-            extras = x.get('research', {})
-        elif post_type == 'event':
-            extras = x.get('event', {})
-        elif post_type == 'bounty':
-            extras = x.get('bounty', {})
-        elif post_type == 'job':
-            extras = x.get('job', {})
-        elif post_type == 'product':
-            extras = x.get('product', {})
-        elif post_type == 'collab':
-            extras = x.get('collab', {})
-        elif post_type == 'question':
-            extras = x.get('question', {})
-        elif post_type == 'ad':
-            extras = x.get('ad', {})
-
+        if post_type == 'poll':      extras = {'poll_options': [{'text': o, 'votes': 0} for o in x.get('pollOptions', [])], 'total_votes': 0}
+        elif post_type == 'research': extras = x.get('research', {})
+        elif post_type == 'event':    extras = x.get('event', {})
+        elif post_type == 'bounty':   extras = x.get('bounty', {})
+        elif post_type == 'job':      extras = x.get('job', {})
+        elif post_type == 'product':  extras = x.get('product', {})
+        elif post_type == 'collab':   extras = x.get('collab', {})
+        elif post_type == 'question': extras = x.get('question', {})
+        elif post_type == 'ad':       extras = x.get('ad', {})
         if hashtags:
             extras['hashtags'] = hashtags
-
         if extras:
-            cur.execute("INSERT INTO post_extras (post_key, data) VALUES (%s,%s)",
-                        (post_key, json.dumps(extras)))
-
-        cur.execute("UPDATE user_auth SET numberofposts = numberofposts + 1 WHERE user_key=%s",
-                    (user_key,))
+            cur.execute("INSERT INTO post_extras (post_key, data) VALUES (%s,%s)", (post_key, json.dumps(extras)))
+        cur.execute("UPDATE user_auth SET numberofposts = numberofposts + 1 WHERE user_key=%s", (user_key,))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Postsuccessmessage, 'post_key': post_key}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
         release_conn(conn)
+
 def delete_post(x, token):
     user_key = validate_session(token)
     if not user_key:
@@ -703,17 +1141,15 @@ def delete_post(x, token):
         if row[0] != user_key:
             return {'status': 403, 'message': 'Not your post.'}
         cur.execute("DELETE FROM posts WHERE post_key=%s", (post_key,))
-        cur.execute("UPDATE user_auth SET numberofposts = numberofposts - 1 WHERE user_key=%s",
-                    (user_key,))
+        cur.execute("UPDATE user_auth SET numberofposts = numberofposts - 1 WHERE user_key=%s", (user_key,))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Postdeletedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
         release_conn(conn)
-
 
 # ═══════════════════════════════════════════════════════════════
 # SETTINGS
@@ -725,25 +1161,25 @@ def get_settings(token):
     user = get_user_by_key(user_key)
     payload = settings_payload(user)
     payload['status'] = 200
-    payload['togglePrivate']           = 'active' if user.get('is_private') else ''
-    payload['toggleActivity']          = 'active' if user.get('show_activity_status') else ''
-    payload['toggleReadReceipts']      = 'active' if user.get('read_receipts') else ''
-    payload['toggleTypingIndicators']  = 'active' if user.get('typing_indicators') else ''
-    payload['toggleMessageRequests']   = 'active' if user.get('message_requests_filter') == 'everyone' else ''
-    payload['togglePush']              = 'active' if user.get('notif_push') else ''
-    payload['toggleLikes']             = 'active' if user.get('notif_likes') else ''
-    payload['toggleComments']          = 'active' if user.get('notif_comments') else ''
-    payload['toggleFollowers']         = 'active' if user.get('notif_follows') else ''
-    payload['toggleDMs']               = 'active' if user.get('notif_messages') else ''
-    payload['toggleMentions']          = 'active' if user.get('notif_mentions') else ''
-    payload['toggleBounties']          = 'active' if user.get('notif_bounties') else ''
-    payload['toggleEvents']            = 'active' if user.get('notif_events') else ''
-    payload['toggleResearch']          = 'active' if user.get('notif_email') else ''
-    payload['toggleEmail']             = 'active' if user.get('notif_email') else ''
-    payload['selectPostVisibility']    = user.get('post_visibility', 'public')
-    payload['selectResearchVisibility']= user.get('research_visibility', 'public')
-    payload['selectMessagePrivacy']    = user.get('message_privacy', 'everyone')
-    payload['selectTagPrivacy']        = user.get('tag_privacy', 'everyone')
+    payload['togglePrivate']            = 'active' if user.get('is_private') else ''
+    payload['toggleActivity']           = 'active' if user.get('show_activity_status') else ''
+    payload['toggleReadReceipts']       = 'active' if user.get('read_receipts') else ''
+    payload['toggleTypingIndicators']   = 'active' if user.get('typing_indicators') else ''
+    payload['toggleMessageRequests']    = 'active' if user.get('message_requests_filter') == 'everyone' else ''
+    payload['togglePush']               = 'active' if user.get('notif_push') else ''
+    payload['toggleLikes']              = 'active' if user.get('notif_likes') else ''
+    payload['toggleComments']           = 'active' if user.get('notif_comments') else ''
+    payload['toggleFollowers']          = 'active' if user.get('notif_follows') else ''
+    payload['toggleDMs']                = 'active' if user.get('notif_messages') else ''
+    payload['toggleMentions']           = 'active' if user.get('notif_mentions') else ''
+    payload['toggleBounties']           = 'active' if user.get('notif_bounties') else ''
+    payload['toggleEvents']             = 'active' if user.get('notif_events') else ''
+    payload['toggleResearch']           = 'active' if user.get('notif_email') else ''
+    payload['toggleEmail']              = 'active' if user.get('notif_email') else ''
+    payload['selectPostVisibility']     = user.get('post_visibility', 'public')
+    payload['selectResearchVisibility'] = user.get('research_visibility', 'public')
+    payload['selectMessagePrivacy']     = user.get('message_privacy', 'everyone')
+    payload['selectTagPrivacy']         = user.get('tag_privacy', 'everyone')
     payload['selectFollowersVisibility']= user.get('followers_list_visibility', 'everyone')
     return payload
 
@@ -765,7 +1201,7 @@ def update_email(x, token):
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Emailupdatesuccessmessage, 'setEmail': new_email}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -787,9 +1223,9 @@ def update_username(x, token):
         cur.close()
         user = get_user_by_key(user_key)
         return {'status': 200, 'message': A.Usernameupdatesuccessmessage,
-                'setUsername': f'{new_username}',
+                'setUsername': new_username,
                 'setProfileHandle': f"{new_username} &bull; {user.get('department','')} &bull; {user.get('university','')}"}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -807,7 +1243,7 @@ def update_bio(x, token):
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Bioupdatesuccessmessage, 'setBio': new_bio}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -823,14 +1259,12 @@ def update_password(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE user_auth SET password=%s, last_password_change=NOW()
-            WHERE user_key=%s
-        """, (hash_password(x.get('new_password', '')), user_key))
+        cur.execute("UPDATE user_auth SET password=%s, last_password_change=NOW() WHERE user_key=%s",
+                    (hash_password(x.get('new_password', '')), user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Passwordupdatesuccessmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -842,10 +1276,9 @@ def update_profile_info(x, token):
         return {'status': 401, 'message': A.Unauthorizedmessage}
     conn = get_conn()
     try:
-        cur = conn.cursor()
-        # Build dynamic update - only update fields that were sent
+        cur    = conn.cursor()
         fields = []
-        vals = []
+        vals   = []
         for col in ['full_name', 'university', 'department', 'academic_level', 'bio']:
             if col in x and x[col] is not None:
                 fields.append(f"{col}=%s")
@@ -860,10 +1293,9 @@ def update_profile_info(x, token):
         return {'status': 200, 'message': A.Profileupdatesuccessmessage,
                 'setProfileName': user['full_name'],
                 'setProfileHandle': f"{user['username']} &bull; {user.get('department','')} &bull; {user.get('university','')}",
-                'department': user.get('department',''),
-            'university':  user.get('university',''),
-            'info': profileinfo(user)}
-    except Exception as e:
+                'department': user.get('department', ''), 'university': user.get('university', ''),
+                'info': profileinfo(user)}
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -880,12 +1312,11 @@ def update_privacy_settings(x, token):
         cur = conn.cursor()
         for field in allowed:
             if field in x:
-                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s",
-                            (x[field], user_key))
+                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s", (x[field], user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Settingsupdatedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -902,12 +1333,11 @@ def update_notification_settings(x, token):
         cur = conn.cursor()
         for field in allowed:
             if field in x:
-                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s",
-                            (x[field], user_key))
+                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s", (x[field], user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Settingsupdatedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -923,12 +1353,11 @@ def update_messaging_settings(x, token):
         cur = conn.cursor()
         for field in allowed:
             if field in x:
-                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s",
-                            (x[field], user_key))
+                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s", (x[field], user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Settingsupdatedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -944,12 +1373,11 @@ def update_appearance(x, token):
         cur = conn.cursor()
         for field in allowed:
             if field in x:
-                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s",
-                            (x[field], user_key))
+                cur.execute(f"UPDATE user_auth SET {field}=%s WHERE user_key=%s", (x[field], user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'message': A.Settingsupdatedmessage}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -964,17 +1392,14 @@ def get_blocked_users(token):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT u.user_key, u.full_name, u.username, u.profilepicurl
-            FROM user_auth u
-            JOIN blocks b ON b.blocked_key = u.user_key
-            WHERE b.blocker_key=%s
-            ORDER BY b.blocked_at DESC
+            FROM user_auth u JOIN blocks b ON b.blocked_key = u.user_key
+            WHERE b.blocker_key=%s ORDER BY b.blocked_at DESC
         """, (user_key,))
         rows = cur.fetchall()
         cur.close()
         return {'status': 200, 'blocked': [dict(r) for r in rows]}
     finally:
         release_conn(conn)
-
 
 # ═══════════════════════════════════════════════════════════════
 # SEARCH
@@ -988,53 +1413,35 @@ def search(x, token):
     try:
         cur     = conn.cursor(cursor_factory=RealDictCursor)
         pattern = f'%{query}%'
-
-        cluster = get_cluster_weights(query)
+        cluster       = get_cluster_weights(query)
         cluster_terms = list(cluster.keys())
-
         cur.execute("""
-            SELECT p.post_key, p.post_type, p.content, p.like_count,
-                   p.comment_count, p.created_at,
+            SELECT p.post_key, p.post_type, p.content, p.like_count, p.comment_count, p.created_at,
                    u.full_name, u.username, u.profilepicurl, u.account_level
-            FROM posts p
-            JOIN user_auth u ON u.user_key = p.user_key
+            FROM posts p JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
             WHERE (p.content ILIKE %s OR COALESCE(pe.data::text,'') ILIKE %s)
-            AND p.visibility = 'public'
-            ORDER BY p.like_count DESC
-            LIMIT 20
+            AND p.visibility = 'public' ORDER BY p.like_count DESC LIMIT 20
         """, (pattern, pattern))
         post_results = []
         for r in cur.fetchall():
             p = dict(r)
             p['time_ago'] = time_ago(p.get('created_at'))
-            p['extras'] = {}
-            p['is_liked'] = False
-            p['is_bookmarked'] = False
-            p['is_following'] = False
+            p['extras'] = {}; p['is_liked'] = False; p['is_bookmarked'] = False; p['is_following'] = False
             post_results.append(p)
-
         cur.execute("""
             SELECT user_key, full_name, username, profilepicurl,
                    department, university, account_level, numberoffollowers
-            FROM user_auth
-            WHERE (full_name ILIKE %s OR username ILIKE %s)
-            AND is_deactivated = FALSE
-            LIMIT 10
+            FROM user_auth WHERE (full_name ILIKE %s OR username ILIKE %s)
+            AND is_deactivated = FALSE LIMIT 10
         """, (pattern, pattern))
         user_results = [dict(r) for r in cur.fetchall()]
-        # Check follow status for each user
         if user_key:
             for u in user_results:
                 cur.execute("SELECT 1 FROM follows WHERE follower_key=%s AND following_key=%s", (user_key, u['user_key']))
                 u['is_following'] = bool(cur.fetchone())
-
         cur.close()
-        return {
-            'status': 200,
-            'posts': post_results,
-            'users': user_results,
-            'cluster_suggestions': cluster_terms[:5]
-        }
+        return {'status': 200, 'posts': post_results, 'users': user_results, 'cluster_suggestions': cluster_terms[:5]}
     finally:
         release_conn(conn)
 
@@ -1047,30 +1454,22 @@ def record_search_pair(x):
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO search_pairs (pair_key, query, selected, weight)
-            VALUES (%s, %s, %s, 1.0)
-            ON CONFLICT (query, selected) DO UPDATE
-              SET weight = search_pairs.weight + 0.5,
-                  last_searched = NOW()
+            INSERT INTO search_pairs (pair_key, query, selected, weight) VALUES (%s,%s,%s,1.0)
+            ON CONFLICT (query, selected) DO UPDATE SET weight=search_pairs.weight+0.5, last_searched=NOW()
         """, (gen_key(), query, selected))
         conn.commit()
         cur.close()
-    except Exception as e:
+    except Exception:
         conn.rollback()
     finally:
         release_conn(conn)
 
 def get_cluster_weights(query):
-    query = query.strip().lower()
-    conn  = get_conn()
+    conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT selected, weight FROM search_pairs
-            WHERE query = %s
-            ORDER BY weight DESC
-            LIMIT 10
-        """, (query,))
+        cur.execute("SELECT selected, weight FROM search_pairs WHERE query=%s ORDER BY weight DESC LIMIT 10",
+                    (query.strip().lower(),))
         rows = cur.fetchall()
         cur.close()
         return {r['selected']: r['weight'] for r in rows}
@@ -1087,13 +1486,12 @@ def push_notification(recipient_key, sender_key, notif_type, post_key, message):
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO notifications
-              (notif_key, recipient_key, sender_key, notif_type, post_key, message)
+            INSERT INTO notifications (notif_key, recipient_key, sender_key, notif_type, post_key, message)
             VALUES (%s,%s,%s,%s,%s,%s)
         """, (gen_key(), recipient_key, sender_key, notif_type, post_key, message))
         conn.commit()
         cur.close()
-    except Exception as e:
+    except Exception:
         conn.rollback()
     finally:
         release_conn(conn)
@@ -1107,27 +1505,15 @@ def get_notifications(token):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT n.*, u.full_name, u.username, u.profilepicurl
-            FROM notifications n
-            LEFT JOIN user_auth u ON u.user_key = n.sender_key
-            WHERE n.recipient_key = %s
-            ORDER BY n.created_at DESC
-            LIMIT 50
+            FROM notifications n LEFT JOIN user_auth u ON u.user_key = n.sender_key
+            WHERE n.recipient_key = %s ORDER BY n.created_at DESC LIMIT 50
         """, (user_key,))
         rows = cur.fetchall()
         cur.close()
         result = []
         for r in rows:
             n = dict(r)
-            ts = n.get('created_at')
-            if ts:
-                import datetime
-                now = datetime.datetime.now(ts.tzinfo)
-                age = int((now - ts).total_seconds())
-                if age < 60:      n['time_ago'] = 'just now'
-                elif age < 3600:  n['time_ago'] = f"{age // 60}m ago"
-                elif age < 86400: n['time_ago'] = f"{age // 3600}h ago"
-                elif age < 604800:n['time_ago'] = f"{age // 86400}d ago"
-                else:             n['time_ago'] = f"{age // 604800}w ago"
+            n['time_ago'] = time_ago(n.get('created_at'))
             result.append(n)
         return {'status': 200, 'notifications': result}
     finally:
@@ -1141,8 +1527,7 @@ def mark_notification_read(x, token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("UPDATE notifications SET is_read=TRUE WHERE notif_key=%s AND recipient_key=%s",
-                    (notif_key, user_key))
+        cur.execute("UPDATE notifications SET is_read=TRUE WHERE notif_key=%s AND recipient_key=%s", (notif_key, user_key))
         conn.commit()
         cur.close()
         return {'status': 200}
@@ -1170,10 +1555,7 @@ def get_unread_notif_count(token):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT COUNT(*) FROM notifications
-            WHERE recipient_key=%s AND is_read=FALSE
-        """, (user_key,))
+        cur.execute("SELECT COUNT(*) FROM notifications WHERE recipient_key=%s AND is_read=FALSE", (user_key,))
         count = cur.fetchone()[0]
         cur.close()
         return count
@@ -1195,15 +1577,11 @@ def get_conversations(token):
                    CASE WHEN c.user_a_key=%s THEN c.user_b_key ELSE c.user_a_key END as other_key,
                    u.full_name, u.username, u.profilepicurl, u.account_level,
                    u.show_activity_status, u.last_seen,
-                   (SELECT content FROM messages m WHERE m.convo_key=c.convo_key
-                    ORDER BY m.sent_at DESC LIMIT 1) as last_msg,
-                   (SELECT sent_at FROM messages m WHERE m.convo_key=c.convo_key
-                    ORDER BY m.sent_at DESC LIMIT 1) as last_msg_time,
-                   (SELECT COUNT(*) FROM messages m WHERE m.convo_key=c.convo_key
-                    AND m.sender_key != %s AND m.is_read=FALSE) as unread_count
+                   (SELECT content FROM messages m WHERE m.convo_key=c.convo_key ORDER BY m.sent_at DESC LIMIT 1) as last_msg,
+                   (SELECT sent_at FROM messages m WHERE m.convo_key=c.convo_key ORDER BY m.sent_at DESC LIMIT 1) as last_msg_time,
+                   (SELECT COUNT(*) FROM messages m WHERE m.convo_key=c.convo_key AND m.sender_key!=%s AND m.is_read=FALSE) as unread_count
             FROM conversations c
-            JOIN user_auth u ON u.user_key =
-                CASE WHEN c.user_a_key=%s THEN c.user_b_key ELSE c.user_a_key END
+            JOIN user_auth u ON u.user_key = CASE WHEN c.user_a_key=%s THEN c.user_b_key ELSE c.user_a_key END
             WHERE c.user_a_key=%s OR c.user_b_key=%s
             ORDER BY last_msg_time DESC NULLS LAST
         """, (user_key, user_key, user_key, user_key, user_key))
@@ -1219,8 +1597,7 @@ def get_or_create_conversation(user_key, other_key):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT convo_key FROM conversations
-            WHERE (user_a_key=%s AND user_b_key=%s)
-               OR (user_a_key=%s AND user_b_key=%s)
+            WHERE (user_a_key=%s AND user_b_key=%s) OR (user_a_key=%s AND user_b_key=%s)
         """, (user_key, other_key, other_key, user_key))
         row = cur.fetchone()
         if row:
@@ -1232,7 +1609,7 @@ def get_or_create_conversation(user_key, other_key):
         conn.commit()
         cur.close()
         return {'status': 200, 'convo_key': convo_key}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         return {'status': 500, 'message': 'Could not create conversation.'}
     finally:
@@ -1248,14 +1625,11 @@ def get_dm_messages(x, token):
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT m.*, u.full_name, u.username, u.profilepicurl
-            FROM messages m
-            JOIN user_auth u ON u.user_key = m.sender_key
-            WHERE m.convo_key=%s
-            ORDER BY m.sent_at ASC
+            FROM messages m JOIN user_auth u ON u.user_key = m.sender_key
+            WHERE m.convo_key=%s ORDER BY m.sent_at ASC
         """, (convo_key,))
         rows = cur.fetchall()
-        cur.execute("UPDATE messages SET is_read=TRUE WHERE convo_key=%s AND sender_key!=%s",
-                    (convo_key, user_key))
+        cur.execute("UPDATE messages SET is_read=TRUE WHERE convo_key=%s AND sender_key!=%s", (convo_key, user_key))
         conn.commit()
         cur.close()
         return {'status': 200, 'messages': [dict(r) for r in rows]}
@@ -1263,7 +1637,7 @@ def get_dm_messages(x, token):
         release_conn(conn)
 
 def send_dm(x, token):
-    user_key     = validate_session(token)
+    user_key      = validate_session(token)
     if not user_key:
         return {'status': 401, 'message': A.Unauthorizedmessage}
     recipient_key = x.get('recipient_key')
@@ -1278,22 +1652,14 @@ def send_dm(x, token):
     try:
         cur     = conn.cursor()
         msg_key = gen_key()
-        cur.execute("""
-            INSERT INTO messages (msg_key, convo_key, sender_key, content, media_url, reply_to_key)
-            VALUES (%s,%s,%s,%s,%s,%s)
-        """, (msg_key, convo_key, user_key, content, media_url, reply_to_key))
-        push_notification(
-            recipient_key=recipient_key,
-            sender_key=user_key,
-            notif_type='message',
-            post_key='',
-            message=content[:100]
-        )
+        cur.execute("INSERT INTO messages (msg_key, convo_key, sender_key, content, media_url, reply_to_key) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (msg_key, convo_key, user_key, content, media_url, reply_to_key))
+        push_notification(recipient_key, user_key, 'message', '', content[:100])
         conn.commit()
         cur.close()
         return {'status': 200, 'msg_key': msg_key, 'convo_key': convo_key,
                 'sent_at': datetime.utcnow().isoformat()}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -1305,25 +1671,15 @@ def get_global_messages():
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT g.*, u.full_name, u.username, u.profilepicurl, u.account_level
-            FROM global_chat g
-            JOIN user_auth u ON u.user_key = g.user_key
-            ORDER BY g.sent_at DESC
-            LIMIT 100
+            FROM global_chat g JOIN user_auth u ON u.user_key = g.user_key
+            ORDER BY g.sent_at DESC LIMIT 100
         """)
         rows = cur.fetchall()
         cur.close()
         result = []
         for r in reversed(rows):
             m = dict(r)
-            ts = m.get('sent_at')
-            if ts:
-                import datetime
-                now = datetime.datetime.now(ts.tzinfo)
-                age = int((now - ts).total_seconds())
-                if age < 60:      m['time_ago'] = 'just now'
-                elif age < 3600:  m['time_ago'] = f"{age // 60}m ago"
-                elif age < 86400: m['time_ago'] = f"{age // 3600}h ago"
-                else:             m['time_ago'] = f"{age // 86400}d ago"
+            m['time_ago'] = time_ago(m.get('sent_at'))
             result.append(m)
         return {'status': 200, 'messages': result}
     finally:
@@ -1345,14 +1701,13 @@ def send_global_message(x, token):
         cur.close()
         user = get_user_by_key(user_key)
         return {'status': 200, 'full_name': user['full_name'],
-                'profilepicurl': user.get('profilepicurl',''),
+                'profilepicurl': user.get('profilepicurl', ''),
                 'content': content, 'sent_at': datetime.utcnow().isoformat()}
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:
         release_conn(conn)
-
 
 # ═══════════════════════════════════════════════════════════════
 # FRONTEND PERSONALIZER
@@ -1362,59 +1717,34 @@ def Frontend_personalizer(x, user, token=None):
     ans['user_key']    = user['user_key']
     ans['department']  = user.get('department', '')
     ans['university']  = user.get('university', '')
-
-    # ── Profile page ──────────────────────────────────────────
-    ans['profilenav'] = drawerprofilenav(user)
-    ans['info']       = profileinfo(user)
-    ans['stats']      = profilestats(user)
-    ans['avatar']     = get_avatar_html(user)
-
-    # ── Followers/Following modal ──────────────────────────────
+    ans['token']       = token or ''
+    ans['profilenav']  = drawerprofilenav(user)
+    ans['info']        = profileinfo(user)
+    ans['stats']       = profilestats(user)
+    ans['avatar']      = get_avatar_html(user)
     ans['userListContent'] = A.nofollowingorfollowersgeneral
-
-    # ── Profile tabs ──────────────────────────────────────────
     ans['tab-posts']    = A.nopostonsignup
     ans['tab-research'] = A.nopostresearchonsignup
     ans['tab-saved']    = A.nopostsavedonsignup
-
-    # ── Settings ──────────────────────────────────────────────
     s = settings_payload(user)
+    s['token'] = token or ''
     for key, val in s.items():
         ans[key] = val
-
-    # ── Notification badge ────────────────────────────────────
-    ans['notif_count'] = 0
-
-    # ── Trending initial sequence ──────────────────────────────
-    ans['feed_sequence'] = generate_feed_sequence(A.FEED_INITIAL_COUNT)
-
-    # ── Suggestions ───────────────────────────────────────────
-    suggestions = get_suggestions(user['user_key'])
-    ans['suggestions_html'] = build_suggestions_html(suggestions)
-
-    # ── Trending topics ───────────────────────────────────────
-    topics = get_trending_topics()
-    ans['trending_topics_html'] = build_trending_topics_html(topics)
-
-    # ── Feed config sent to JS ────────────────────────────────
+    ans['notif_count']         = 0
+    ans['feed_sequence']       = generate_feed_sequence(A.FEED_INITIAL_COUNT)
+    ans['suggestions_html']    = build_suggestions_html(get_suggestions(user['user_key']))
+    ans['trending_topics_html']= build_trending_topics_html(get_trending_topics())
     ans['feed_config'] = {
         'initial_count':  A.FEED_INITIAL_COUNT,
         'scroll_count':   A.FEED_SCROLL_COUNT,
         'max_dom':        A.FEED_MAX_DOM,
         'scroll_trigger': A.FEED_SCROLL_TRIGGER
     }
-
-    # ── Session info ──────────────────────────────────────────
-    ans['user_key'] = user['user_key']
-    ans['token']    = token
-
     return ans
 
-
 # ═══════════════════════════════════════════════════════════════
-# FRONTEND REQUEST EXECUTOR
+# RATE LIMITER
 # ═══════════════════════════════════════════════════════════════
-# Simple in-memory rate limiter
 _rl = {}
 def _rate_ok(key, limit=100, window=60):
     import time; now=time.time()
@@ -1422,11 +1752,15 @@ def _rate_ok(key, limit=100, window=60):
     if len(_rl[key])>=limit: return False
     _rl[key].append(now); return True
 
+# ═══════════════════════════════════════════════════════════════
+# FRONTEND REQUEST EXECUTOR
+# ═══════════════════════════════════════════════════════════════
 def Frontend_request_executor(x, token=None):
     status = x.get('status', '')
 
     # ── SIGNUP ────────────────────────────────────────────────
     if status == 'signup':
+        _email_bf = x.get('email', '').strip().lower()  # FIXED
         check = verify_signup_data(x)
         if check['status'] != 200:
             msg_map = {
@@ -1434,26 +1768,8 @@ def Frontend_request_executor(x, token=None):
                 'email':    A.Emailexistonsignupmessage,
                 'username': A.Usernameexistonsignupmessage,
             }
-            # Increment failed attempt counter
-            if _email_bf:
-                try:
-                    conn_fa = get_conn()
-                    cur_fa = conn_fa.cursor(cursor_factory=RealDictCursor)
-                    cur_fa.execute("SELECT failed_login_attempts FROM user_auth WHERE email=%s",(_email_bf,))
-                    _uf = cur_fa.fetchone()
-                    if _uf:
-                        _attempts = (_uf.get('failed_login_attempts') or 0) + 1
-                        if _attempts >= 5:
-                            import datetime as _dbt2
-                            _lock = _dbt2.datetime.utcnow() + _dbt2.timedelta(minutes=15)
-                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s,locked_until=%s WHERE email=%s",(_attempts,_lock,_email_bf))
-                        else:
-                            cur_fa.execute("UPDATE user_auth SET failed_login_attempts=%s WHERE email=%s",(_attempts,_email_bf))
-                        conn_fa.commit()
-                    release_conn(conn_fa)
-                except: pass
             return {'status': 400, 'message': msg_map.get(check.get('error'), A.Genericerror)}
-        user_key = insert_user(x)
+        user_key  = insert_user(x)
         new_token = create_session(user_key, x.get('device_info', ''))
         user      = get_user_by_key(user_key)
         ans       = {'status': 200, 'message': A.Successfulsignupmessage}
@@ -1462,7 +1778,6 @@ def Frontend_request_executor(x, token=None):
 
     # ── SIGNIN ────────────────────────────────────────────────
     elif status == 'signin':
-        # Brute force protection
         _email_bf = x.get('email','').strip().lower()
         if _email_bf:
             conn_bf = get_conn()
@@ -1486,7 +1801,6 @@ def Frontend_request_executor(x, token=None):
                 'credentials': A.Invalidcredentialsmessage,
                 'deactivated': A.Accountdeactivatedmessage,
             }
-            # Increment failed attempt counter
             if _email_bf:
                 try:
                     conn_fa = get_conn()
@@ -1509,7 +1823,6 @@ def Frontend_request_executor(x, token=None):
         new_token = create_session(user_key, x.get('device_info', ''))
         user      = get_user_by_key(user_key)
         update_last_seen(user_key)
-        # Reset brute force counter on success
         try:
             conn_rs2 = get_conn()
             cur_rs2 = conn_rs2.cursor()
@@ -1517,12 +1830,7 @@ def Frontend_request_executor(x, token=None):
             conn_rs2.commit()
             release_conn(conn_rs2)
         except: pass
-        # Signin loads real data
-        followers_data = get_followers(user_key)
         following_data = get_following(user_key)
-        posts_data     = get_user_posts(user_key, 'posts')
-        research_data  = get_user_posts(user_key, 'research')
-        saved_data     = get_user_posts(user_key, 'saved')
         notif_count    = get_unread_notif_count(new_token)
         ans            = {'status': 200, 'message': A.Successfulsigninmessage}
         ans           |= Frontend_personalizer(x, user, new_token)
@@ -1603,17 +1911,14 @@ def Frontend_request_executor(x, token=None):
     elif status == 'report':
         user_key = validate_session(token)
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        _rtype = x.get('target_type')
-        _rkey  = x.get('target_key')
+        _rtype = x.get('target_type'); _rkey = x.get('target_key')
         _rreason = x.get('reason','Inappropriate content')
         if not _rtype or not _rkey: return {'status':400,'message':'Missing target'}
         _rc = get_conn()
         try:
             _rcc = _rc.cursor()
-            _rcc.execute(
-                "INSERT INTO reports(report_key,reporter_key,target_type,target_key,reason) VALUES(%s,%s,%s,%s,%s)",
-                (gen_key(),user_key,_rtype,_rkey,_rreason)
-            )
+            _rcc.execute("INSERT INTO reports(report_key,reporter_key,target_type,target_key,reason) VALUES(%s,%s,%s,%s,%s)",
+                         (gen_key(),user_key,_rtype,_rkey,_rreason))
             _rc.commit()
             return {'status':200,'message':'Report submitted. We will review it.'}
         except: return {'status':500,'message':'Could not submit report'}
@@ -1622,8 +1927,7 @@ def Frontend_request_executor(x, token=None):
     elif status == 'toggle_mute':
         user_key = validate_session(token)
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        _mtkey = x.get('target_key')
-        _mtc = get_conn()
+        _mtkey = x.get('target_key'); _mtc = get_conn()
         try:
             _mtcc = _mtc.cursor()
             _mtcc.execute("SELECT 1 FROM mutes WHERE muter_key=%s AND muted_key=%s",(user_key,_mtkey))
@@ -1647,8 +1951,7 @@ def Frontend_request_executor(x, token=None):
     elif status == 'edit_post':
         user_key = validate_session(token)
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        _epostkey = x.get('post_key')
-        _econtent = (x.get('content') or '').strip()
+        _epostkey = x.get('post_key'); _econtent = (x.get('content') or '').strip()
         if not _econtent: return {'status':400,'message':'Content cannot be empty'}
         _ec = get_conn()
         try:
@@ -1668,8 +1971,7 @@ def Frontend_request_executor(x, token=None):
     elif status == 'pin_post':
         user_key = validate_session(token)
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        _ppkey = x.get('post_key')
-        _pc = get_conn()
+        _ppkey = x.get('post_key'); _pc = get_conn()
         try:
             _pcc = _pc.cursor(cursor_factory=RealDictCursor)
             _pcc.execute("SELECT user_key FROM posts WHERE post_key=%s",(_ppkey,))
@@ -1716,29 +2018,30 @@ def Frontend_request_executor(x, token=None):
             'followers':      user.get('numberoffollowers', 0),
             'likes':          user.get('numberoflikes', 0),
             'posts':          user.get('numberofposts', 0),
+            'user_key':       user['user_key'],
         }
 
     elif status == 'get_global_research':
         seen_keys = x.get('seen_keys', [])
-        posts     = get_global_research(seen_keys)
-        return {'status': 200, 'posts': posts}
+        return {'status': 200, 'posts': get_global_research(seen_keys)}
 
     elif status == 'get_or_create_conversation':
-        other_key = x.get('other_key')
+        other_key    = x.get('other_key')
         user_key_val = validate_session(token)
         if not user_key_val:
             return {'status': 401, 'message': A.Unauthorizedmessage}
-        res = get_or_create_conversation(user_key_val, other_key)
-        return res
+        return get_or_create_conversation(user_key_val, other_key)
+
     elif status == 'get_announcements':
-        anns = get_announcements()
-        return {'status': 200, 'announcements': anns}
+        return {'status': 200, 'announcements': get_announcements()}
+
     elif status == 'get_post':
         user_key = validate_session(token)
         if not user_key: return {'status': 401, 'message': A.Unauthorizedmessage}
         post = get_post(x.get('post_key'), user_key)
         if not post: return {'status': 404, 'message': 'Post not found.'}
         return {'status': 200, 'post': post}
+
     elif status == 'get_user_posts':
         user_key = validate_session(token)
         if not user_key:
@@ -1752,43 +2055,43 @@ def Frontend_request_executor(x, token=None):
         user_key = validate_session(token)
         if not user_key:
             return {'status': 401, 'message': A.Unauthorizedmessage}
-        target   = x.get('target_key', user_key)
-        users    = get_followers(target)
+        target = x.get('target_key', user_key)
+        users  = get_followers(target)
         return {'status': 200, 'userListContent': build_user_list_html(users, user_key)}
 
     elif status == 'get_following':
         user_key = validate_session(token)
         if not user_key:
             return {'status': 401, 'message': A.Unauthorizedmessage}
-        target   = x.get('target_key', user_key)
-        users    = get_following(target)
+        target = x.get('target_key', user_key)
+        users  = get_following(target)
         return {'status': 200, 'userListContent': build_user_list_html(users, user_key)}
 
     elif status == 'update_avatar':   return update_avatar(x, token)
     elif status == 'remove_avatar':   return remove_avatar(token)
 
     # ── SETTINGS ──────────────────────────────────────────────
-    elif status == 'get_settings':              return get_settings(token)
-    elif status == 'update_email':              return update_email(x, token)
-    elif status == 'update_username':           return update_username(x, token)
-    elif status == 'update_bio':                return update_bio(x, token)
-    elif status == 'update_password':           return update_password(x, token)
-    elif status == 'update_profile_info':       return update_profile_info(x, token)
-    elif status == 'update_privacy_settings':   return update_privacy_settings(x, token)
-    elif status == 'update_notification_settings': return update_notification_settings(x, token)
-    elif status == 'update_messaging_settings': return update_messaging_settings(x, token)
-    elif status == 'update_appearance':         return update_appearance(x, token)
-    elif status == 'get_blocked_users':         return get_blocked_users(token)
-    elif status == 'deactivate_account':        return deactivate_account(x, token)
-    elif status == 'delete_account':            return delete_account(x, token)
+    elif status == 'get_settings':                  return get_settings(token)
+    elif status == 'update_email':                  return update_email(x, token)
+    elif status == 'update_username':               return update_username(x, token)
+    elif status == 'update_bio':                    return update_bio(x, token)
+    elif status == 'update_password':               return update_password(x, token)
+    elif status == 'update_profile_info':           return update_profile_info(x, token)
+    elif status == 'update_privacy_settings':       return update_privacy_settings(x, token)
+    elif status == 'update_notification_settings':  return update_notification_settings(x, token)
+    elif status == 'update_messaging_settings':     return update_messaging_settings(x, token)
+    elif status == 'update_appearance':             return update_appearance(x, token)
+    elif status == 'get_blocked_users':             return get_blocked_users(token)
+    elif status == 'deactivate_account':            return deactivate_account(x, token)
+    elif status == 'delete_account':                return delete_account(x, token)
 
     # ── SEARCH ────────────────────────────────────────────────
-    elif status == 'search':              return search(x, token)
-    elif status == 'record_search_pair':  record_search_pair(x); return {'status': 200}
+    elif status == 'search':             return search(x, token)
+    elif status == 'record_search_pair': record_search_pair(x); return {'status': 200}
 
     # ── NOTIFICATIONS ─────────────────────────────────────────
-    elif status == 'get_notifications':         return get_notifications(token)
-    elif status == 'mark_notification_read':    return mark_notification_read(x, token)
+    elif status == 'get_notifications':           return get_notifications(token)
+    elif status == 'mark_notification_read':      return mark_notification_read(x, token)
     elif status == 'mark_all_notifications_read': return mark_all_notifications_read(token)
     elif status == 'get_unread_notif_count':
         return {'status': 200, 'count': get_unread_notif_count(token)}
@@ -1834,10 +2137,7 @@ def Frontend_request_executor(x, token=None):
         try:
             import datetime as _dt2
             _tcc2 = _tc2.cursor(cursor_factory=RealDictCursor)
-            _tcc2.execute(
-                "SELECT c.last_typing_key,c.last_typing_at,u.full_name FROM conversations c LEFT JOIN user_auth u ON u.user_key=c.last_typing_key WHERE c.conversation_key=%s",
-                (conv_key,)
-            )
+            _tcc2.execute("SELECT c.last_typing_key,c.last_typing_at,u.full_name FROM conversations c LEFT JOIN user_auth u ON u.user_key=c.last_typing_key WHERE c.conversation_key=%s",(conv_key,))
             row = _tcc2.fetchone()
             if row and row['last_typing_key'] and row['last_typing_key']!=user_key and row['last_typing_at']:
                 age = (_dt2.datetime.utcnow()-row['last_typing_at'].replace(tzinfo=None)).total_seconds()
@@ -1850,7 +2150,6 @@ def Frontend_request_executor(x, token=None):
     elif status == 'get_global_messages': return get_global_messages()
     elif status == 'send_global_message': return send_global_message(x, token)
 
-    # ── UNKNOWN ───────────────────────────────────────────────
     elif status == 'request_password_reset':
         email = x.get('email','').strip().lower()
         if not email: return {'status':400,'message':'Email required'}
@@ -1861,10 +2160,11 @@ def Frontend_request_executor(x, token=None):
             user = cur_pr.fetchone()
             if not user: return {'status':404,'message':'No account with that email'}
             import random as _rand3, datetime as _dt4
-            code  = str(_rand3.randint(100000,999999))
+            code   = str(_rand3.randint(100000,999999))
             token2 = gen_key()
             expires = _dt4.datetime.utcnow() + _dt4.timedelta(minutes=15)
-            cur_pr.execute("INSERT INTO password_resets(token,user_key,code,expires_at) VALUES(%s,%s,%s,%s) ON CONFLICT(user_key) DO UPDATE SET token=%s,code=%s,expires_at=%s",(token2,user['user_key'],code,expires,token2,code,expires))
+            cur_pr.execute("INSERT INTO password_resets(token,user_key,code,expires_at) VALUES(%s,%s,%s,%s) ON CONFLICT(user_key) DO UPDATE SET token=%s,code=%s,expires_at=%s",
+                           (token2,user['user_key'],code,expires,token2,code,expires))
             conn_pr.commit()
             return {'status':200,'code':code,'token':token2,'message':'Reset code generated'}
         except Exception as ex: return {'status':500,'message':str(ex)}
@@ -1875,14 +2175,13 @@ def Frontend_request_executor(x, token=None):
         if len(_np)<8: return {'status':400,'message':'Password must be at least 8 characters'}
         conn_cp = get_conn()
         try:
-            import datetime as _dt5, bcrypt as _bc2
+            import datetime as _dt5
             cur_cp = conn_cp.cursor(cursor_factory=RealDictCursor)
             cur_cp.execute("SELECT * FROM password_resets WHERE token=%s AND code=%s",(_tok,_code))
             row = cur_cp.fetchone()
             if not row: return {'status':400,'message':'Invalid or expired code'}
             if _dt5.datetime.utcnow() > row['expires_at'].replace(tzinfo=None): return {'status':400,'message':'Code expired'}
-            hashed = _bc2.hashpw(_np.encode(),_bc2.gensalt()).decode()
-            cur_cp.execute("UPDATE user_auth SET password_hash=%s WHERE user_key=%s",(hashed,row['user_key']))
+            cur_cp.execute("UPDATE user_auth SET password=%s WHERE user_key=%s",(hash_password(_np),row['user_key']))
             cur_cp.execute("DELETE FROM password_resets WHERE user_key=%s",(row['user_key'],))
             conn_cp.commit()
             return {'status':200,'message':'Password reset successfully'}
@@ -1915,23 +2214,7 @@ def Frontend_request_executor(x, token=None):
             return {'status':200,'user_key':row['user_key']} if row else {'status':404,'message':'User not found'}
         finally: release_conn(conn_gu)
 
-    elif status == 'rsvp_event':
-        user_key = validate_session(token)
-        if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        _pk = x.get('post_key')
-        conn_rv = get_conn()
-        try:
-            cur_rv = conn_rv.cursor(cursor_factory=RealDictCursor)
-            cur_rv.execute("SELECT 1 FROM post_applications WHERE post_key=%s AND applicant_key=%s AND note='rsvp'",(_pk,user_key))
-            if cur_rv.fetchone():
-                cur_rv.execute("DELETE FROM post_applications WHERE post_key=%s AND applicant_key=%s AND note='rsvp'",(_pk,user_key))
-                action='not_going'
-            else:
-                cur_rv.execute("INSERT INTO post_applications(application_key,post_key,applicant_key,note,status) VALUES(%s,%s,%s,'rsvp','accepted') ON CONFLICT DO NOTHING",(gen_key(),_pk,user_key))
-                action='going'
-            conn_rv.commit()
-            return {'status':200,'action':action}
-        finally: release_conn(conn_rv)
+    elif status == 'rsvp_event':      return rsvp_event(x, token)
 
     elif status == 'get_rsvps':
         user_key = validate_session(token)
@@ -1965,8 +2248,7 @@ def Frontend_request_executor(x, token=None):
         conn_ap = get_conn()
         try:
             cur_ap = conn_ap.cursor(cursor_factory=RealDictCursor)
-            sql_ap = "SELECT pa.*,p.content,pe.data as extras,u.full_name as poster_name FROM post_applications pa JOIN posts p ON p.post_key=pa.post_key LEFT JOIN post_extras pe ON pe.post_key=pa.post_key LEFT JOIN user_auth u ON u.user_key=p.user_key WHERE pa.applicant_key=%s ORDER BY pa.created_at DESC"
-            cur_ap.execute(sql_ap,(user_key,))
+            cur_ap.execute("SELECT pa.*,p.content,pe.data as extras,u.full_name as poster_name FROM post_applications pa JOIN posts p ON p.post_key=pa.post_key LEFT JOIN post_extras pe ON pe.post_key=pa.post_key LEFT JOIN user_auth u ON u.user_key=p.user_key WHERE pa.applicant_key=%s ORDER BY pa.created_at DESC",(user_key,))
             rows = cur_ap.fetchall()
             return {'status':200,'applications':[dict(r) for r in rows]}
         finally: release_conn(conn_ap)
@@ -1981,8 +2263,7 @@ def Frontend_request_executor(x, token=None):
             cur_pa.execute("SELECT user_key FROM posts WHERE post_key=%s",(_pk,))
             owner = cur_pa.fetchone()
             if not owner or owner['user_key']!=user_key: return {'status':403,'message':'Not your post'}
-            sql_pa = "SELECT pa.*,u.full_name,u.username,u.profilepicurl,u.department,u.university FROM post_applications pa JOIN user_auth u ON u.user_key=pa.applicant_key WHERE pa.post_key=%s ORDER BY pa.created_at DESC"
-            cur_pa.execute(sql_pa,(_pk,))
+            cur_pa.execute("SELECT pa.*,u.full_name,u.username,u.profilepicurl,u.department,u.university FROM post_applications pa JOIN user_auth u ON u.user_key=pa.applicant_key WHERE pa.post_key=%s ORDER BY pa.created_at DESC",(_pk,))
             rows = cur_pa.fetchall()
             return {'status':200,'applications':[dict(r) for r in rows]}
         finally: release_conn(conn_pa)
@@ -2010,7 +2291,7 @@ def Frontend_request_executor(x, token=None):
             cur_gd = conn_gd.cursor(cursor_factory=RealDictCursor)
             cur_gd.execute("SELECT full_name,username,email,bio,university,department,academic_level,created_at FROM user_auth WHERE user_key=%s",(user_key,))
             profile = cur_gd.fetchone()
-            cur_gd.execute("SELECT post_key,post_type,content,created_at,like_count,comment_count,view_count FROM posts WHERE user_key=%s ORDER BY created_at DESC LIMIT 100",(user_key,))
+            cur_gd.execute("SELECT post_key,post_type,content,created_at,like_count,comment_count FROM posts WHERE user_key=%s ORDER BY created_at DESC LIMIT 100",(user_key,))
             posts = cur_gd.fetchall()
             return {'status':200,'profile':dict(profile) if profile else {},'posts':[dict(p) for p in posts]}
         finally: release_conn(conn_gd)
@@ -2056,13 +2337,7 @@ def Frontend_request_executor(x, token=None):
     elif status == 'ping_online':
         user_key = validate_session(token)
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
-        conn_po = get_conn()
-        try:
-            cur_po = conn_po.cursor()
-            cur_po.execute("UPDATE user_auth SET last_seen=NOW() WHERE user_key=%s",(user_key,))
-            conn_po.commit()
-        except: pass
-        finally: release_conn(conn_po)
+        update_last_seen(user_key)
         return {'status':200}
 
     elif status == 'dismiss_notification':
@@ -2072,11 +2347,10 @@ def Frontend_request_executor(x, token=None):
         conn_dn = get_conn()
         try:
             cur_dn = conn_dn.cursor()
-            cur_dn.execute("DELETE FROM notifications WHERE notification_key=%s AND recipient_key=%s",(notif_key,user_key))
+            cur_dn.execute("DELETE FROM notifications WHERE notif_key=%s AND recipient_key=%s",(notif_key,user_key))
             conn_dn.commit()
             return {'status':200}
         finally: release_conn(conn_dn)
-
 
     elif status == 'mark_dm_read':
         user_key = validate_session(token)
@@ -2085,7 +2359,7 @@ def Frontend_request_executor(x, token=None):
         conn_mr = get_conn()
         try:
             cur_mr = conn_mr.cursor()
-            cur_mr.execute("UPDATE messages SET read_at=NOW() WHERE conversation_key=%s AND sender_key!=%s AND read_at IS NULL",(convo_key, user_key))
+            cur_mr.execute("UPDATE messages SET is_read=TRUE WHERE convo_key=%s AND sender_key!=%s AND is_read=FALSE",(convo_key, user_key))
             conn_mr.commit()
             return {'status':200}
         finally: release_conn(conn_mr)
@@ -2095,10 +2369,13 @@ def Frontend_request_executor(x, token=None):
         if not user_key: return {'status':401,'message':A.Unauthorizedmessage}
         conn_ud = get_conn()
         try:
-            cur_ud = conn_ud.cursor(cursor_factory=RealDictCursor)
-            cur_ud.execute("SELECT COUNT(*) as cnt FROM messages m JOIN conversations c ON c.conversation_key=m.conversation_key WHERE (c.user1_key=%s OR c.user2_key=%s) AND m.sender_key!=%s AND m.read_at IS NULL",(user_key,user_key,user_key))
+            cur_ud = conn_ud.cursor()
+            cur_ud.execute("""SELECT COUNT(*) as cnt FROM messages m
+                JOIN conversations c ON c.convo_key=m.convo_key
+                WHERE (c.user_a_key=%s OR c.user_b_key=%s) AND m.sender_key!=%s AND m.is_read=FALSE""",
+                (user_key,user_key,user_key))
             row = cur_ud.fetchone()
-            return {'status':200,'count':int(row['cnt']) if row else 0}
+            return {'status':200,'count':int(row[0]) if row else 0}
         finally: release_conn(conn_ud)
 
     elif status == 'cancel_event':
@@ -2115,7 +2392,8 @@ def Frontend_request_executor(x, token=None):
             cur_ce.execute("SELECT applicant_key FROM post_applications WHERE post_key=%s AND note='rsvp'",(post_key,))
             rsvps = cur_ce.fetchall()
             for r in rsvps:
-                cur_ce.execute("INSERT INTO notifications(notification_key,recipient_key,sender_key,type,post_key,message,created_at) VALUES(%s,%s,%s,'event_cancelled',%s,%s,NOW())",(gen_key(),r['applicant_key'],user_key,post_key,f"Event cancelled: {reason}"))
+                cur_ce.execute("INSERT INTO notifications(notif_key,recipient_key,sender_key,notif_type,post_key,message) VALUES(%s,%s,%s,'event_cancelled',%s,%s)",
+                               (gen_key(),r['applicant_key'],user_key,post_key,f"Event cancelled: {reason}"))
             conn_ce.commit()
             return {'status':200,'notified':len(rsvps)}
         finally: release_conn(conn_ce)
@@ -2126,7 +2404,7 @@ def Frontend_request_executor(x, token=None):
             cur_rt = conn_rt.cursor(cursor_factory=RealDictCursor)
             cur_rt.execute("SELECT pe.data->>'tags' as tags FROM post_extras pe JOIN posts p ON p.post_key=pe.post_key WHERE p.post_type='research' AND pe.data->>'tags' IS NOT NULL ORDER BY p.created_at DESC LIMIT 200")
             rows = cur_rt.fetchall()
-            from collections import Counter; import json
+            from collections import Counter
             all_tags = []
             for r in rows:
                 try:
@@ -2184,7 +2462,6 @@ def Frontend_request_executor(x, token=None):
             return {'status':200,'expired':cur_eb.rowcount}
         finally: release_conn(conn_eb)
 
-
     elif status == 'get_bounties':
         conn_gb = get_conn()
         try:
@@ -2192,15 +2469,9 @@ def Frontend_request_executor(x, token=None):
             category  = x.get('category')
             seen_keys = x.get('seen_keys') or []
             if category:
-                cur_gb.execute(
-                    "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key LEFT JOIN post_extras pe ON pe.post_key=p.post_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) AND (pe.data->>'category')=%s ORDER BY p.created_at DESC LIMIT 20",
-                    (seen_keys, category)
-                )
+                cur_gb.execute("SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key LEFT JOIN post_extras pe ON pe.post_key=p.post_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) AND (pe.data->>'category')=%s ORDER BY p.created_at DESC LIMIT 20",(seen_keys, category))
             else:
-                cur_gb.execute(
-                    "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) ORDER BY p.created_at DESC LIMIT 20",
-                    (seen_keys,)
-                )
+                cur_gb.execute("SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level FROM posts p JOIN user_auth u ON u.user_key=p.user_key WHERE p.post_type='bounty' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s) ORDER BY p.created_at DESC LIMIT 20",(seen_keys,))
             posts = cur_gb.fetchall()
             return {'status':200,'posts':[dict(p) for p in posts]}
         finally: release_conn(conn_gb)
@@ -2213,10 +2484,8 @@ def Frontend_request_executor(x, token=None):
             sort_by   = x.get('sort','recent')
             seen_keys = x.get('seen_keys') or []
             sort_col  = 'p.created_at DESC'
-            if sort_by == 'price_asc':
-                sort_col = "(pe.data->>'price')::numeric ASC NULLS LAST"
-            elif sort_by == 'price_desc':
-                sort_col = "(pe.data->>'price')::numeric DESC NULLS LAST"
+            if sort_by == 'price_asc':  sort_col = "(pe.data->>'price')::numeric ASC NULLS LAST"
+            elif sort_by == 'price_desc': sort_col = "(pe.data->>'price')::numeric DESC NULLS LAST"
             base_q = "SELECT p.*,u.full_name,u.username,u.profilepicurl,u.account_level,pe.data as extras FROM posts p JOIN user_auth u ON u.user_key=p.user_key LEFT JOIN post_extras pe ON pe.post_key=p.post_key WHERE p.post_type='product' AND p.show_in_feed=TRUE AND p.post_key!=ALL(%s)"
             if category:
                 cur_gm.execute(base_q + " AND (pe.data->>'category')=%s ORDER BY " + sort_col + " LIMIT 30", (seen_keys, category))
@@ -2239,7 +2508,6 @@ def Frontend_request_executor(x, token=None):
             return {'status':200,'message':'Application withdrawn'}
         finally: release_conn(conn_wa)
 
-
     elif status == 'forgot_password':
         email = x.get('email','').lower().strip()
         conn_fp = get_conn()
@@ -2249,18 +2517,16 @@ def Frontend_request_executor(x, token=None):
             user = cur_fp.fetchone()
             if not user:
                 return {'status':200,'message':'If that email exists, a reset link has been sent'}
-            import secrets, datetime
+            import secrets, datetime as _dtfp
             reset_token = secrets.token_urlsafe(32)
-            expires = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            expires = _dtfp.datetime.utcnow() + _dtfp.timedelta(hours=1)
             cur_fp.execute("UPDATE user_auth SET reset_token=%s, reset_token_expires=%s WHERE user_key=%s",(reset_token,expires,user['user_key']))
             conn_fp.commit()
-            # In production: send email with reset link
             return {'status':200,'message':'Reset link sent'}
         finally: release_conn(conn_fp)
 
     else:
         return {'status': 400, 'message': A.Genericerror}
-
 
 # ── Startup ───────────────────────────────────────────────────
 #create_table()
