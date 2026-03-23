@@ -8,27 +8,23 @@ _db_url = os.environ.get('DATABASE_URL', '')
 
 if _db_url:
     import urllib.parse as _up
-    _r = _up.urlparse(_db_url)
+    _r          = _up.urlparse(_db_url)
     DB_HOST     = _r.hostname
-    DB_NAME     = _r.path.lstrip('/')
-    DB_NAME     = DB_NAME.split('?')[0]
+    DB_NAME     = _r.path.lstrip('/').split('?')[0]
     DB_USER     = _r.username
     DB_PASSWORD = _r.password
     DB_PORT     = _r.port or 5432
 else:
-    DB_HOST     = "localhost"
-    DB_NAME     = "TrendsDatabase"
-    DB_USER     = "postgres"
-    DB_PASSWORD = "password"
+    DB_HOST     = "dpg-d70himndiees73dlbeig-a.frankfurt-postgres.render.com"
+    DB_NAME     = "trends_db2"
+    DB_USER     = "trends_db2_user"
+    DB_PASSWORD = "h5NO8WY8nxLF64WSM7jwYZ7b8B7dCOiR"
     DB_PORT     = 5432
 
 # ── CLOUDINARY ──────────────────────────────────────────────────
-#CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', 'your_cloud_name_here')
-CLOUDINARY_CLOUD_NAME = 'ddusfl7pi'
-#CLOUDINARY_API_KEY    = os.environ.get('CLOUDINARY_API_KEY',    'your_api_key_here')
-CLOUDINARY_API_KEY    = '599965682593626'
-#CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', 'your_api_secret_here')
-CLOUDINARY_API_SECRET = 'pUcb90_1jtv-rDlHXRRsfDcBK5k'
+CLOUDINARY_CLOUD_NAME = os.environ.get('CLOUDINARY_CLOUD_NAME', 'ddusfl7pi')
+CLOUDINARY_API_KEY    = os.environ.get('CLOUDINARY_API_KEY',    '599965682593626')
+CLOUDINARY_API_SECRET = os.environ.get('CLOUDINARY_API_SECRET', 'pUcb90_1jtv-rDlHXRRsfDcBK5k')
 
 # ── SESSION ─────────────────────────────────────────────────────
 SECRET_KEY            = os.environ.get('SECRET_KEY', 'treands_secret_key_change_in_production')
@@ -99,23 +95,23 @@ Commentnotfoundmsg    = "Comment not found."
 Nosearchresultsmessage = "No results found."
 
 # ── FEED DEFAULTS ───────────────────────────────────────────────
-FEED_INITIAL_COUNT    = 20
-FEED_SCROLL_COUNT     = 10
-FEED_MAX_DOM          = 50
-FEED_SCROLL_TRIGGER   = 4
-AD_FREQUENCY          = 8
-TRENDING_FREQUENCY    = 5
-SUGGESTION_FREQUENCY  = 10
-MAX_SAME_TYPE_IN_ROW  = 4
+FEED_INITIAL_COUNT   = 20
+FEED_SCROLL_COUNT    = 10
+FEED_MAX_DOM         = 50
+FEED_SCROLL_TRIGGER  = 4
+AD_FREQUENCY         = 8
+TRENDING_FREQUENCY   = 5
+SUGGESTION_FREQUENCY = 10
+MAX_SAME_TYPE_IN_ROW = 4
 
 # ── SCORING WEIGHTS ─────────────────────────────────────────────
-SCORE_LIKE            = 1
-SCORE_COMMENT         = 2
-SCORE_SHARE           = 1.5
-SCORE_UNIVERSITY      = 20
-SCORE_DEPARTMENT      = 15
-SCORE_ACADEMIC_LEVEL  = 10
-SCORE_FOLLOWING       = 40
-SCORE_RECENCY_1HR     = 50
-SCORE_RECENCY_6HR     = 30
-SCORE_RECENCY_24HR    = 10
+SCORE_LIKE           = 1
+SCORE_COMMENT        = 2
+SCORE_SHARE          = 1.5
+SCORE_UNIVERSITY     = 20
+SCORE_DEPARTMENT     = 15
+SCORE_ACADEMIC_LEVEL = 10
+SCORE_FOLLOWING      = 40
+SCORE_RECENCY_1HR    = 50
+SCORE_RECENCY_6HR    = 30
+SCORE_RECENCY_24HR   = 10
