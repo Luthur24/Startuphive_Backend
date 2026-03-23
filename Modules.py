@@ -34,6 +34,300 @@ def release_conn(conn):
     except Exception:
         pass
 
+def create_tables():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_auth (
+            user_key                  TEXT PRIMARY KEY,
+            full_name                 TEXT NOT NULL,
+            username                  TEXT UNIQUE NOT NULL,
+            email                     TEXT UNIQUE NOT NULL,
+            password                  TEXT NOT NULL,
+            biodescription            TEXT,
+            profilepicurl             TEXT,
+            university                TEXT,
+            department                TEXT,
+            academic_level            TEXT,
+            account_level             TEXT DEFAULT 'free',
+            is_deactivated            BOOLEAN DEFAULT FALSE,
+            is_verified               BOOLEAN DEFAULT FALSE,
+            is_private                BOOLEAN DEFAULT FALSE,
+            numberoffollowers         INTEGER DEFAULT 0,
+            numberoffollowing         INTEGER DEFAULT 0,
+            numberofposts             INTEGER DEFAULT 0,
+            numberoflikes             INTEGER DEFAULT 0,
+            show_activity_status      BOOLEAN DEFAULT TRUE,
+            read_receipts             BOOLEAN DEFAULT TRUE,
+            typing_indicators         BOOLEAN DEFAULT TRUE,
+            message_requests_filter   TEXT DEFAULT 'everyone',
+            post_visibility           TEXT DEFAULT 'public',
+            research_visibility       TEXT DEFAULT 'public',
+            message_privacy           TEXT DEFAULT 'everyone',
+            tag_privacy               TEXT DEFAULT 'everyone',
+            followers_list_visibility TEXT DEFAULT 'everyone',
+            notif_likes               BOOLEAN DEFAULT TRUE,
+            notif_comments            BOOLEAN DEFAULT TRUE,
+            notif_follows             BOOLEAN DEFAULT TRUE,
+            notif_mentions            BOOLEAN DEFAULT TRUE,
+            notif_messages            BOOLEAN DEFAULT TRUE,
+            notif_events              BOOLEAN DEFAULT TRUE,
+            notif_bounties            BOOLEAN DEFAULT TRUE,
+            notif_email               BOOLEAN DEFAULT FALSE,
+            notif_push                BOOLEAN DEFAULT TRUE,
+            theme                     TEXT DEFAULT 'dark',
+            font_size                 TEXT DEFAULT 'medium',
+            compact_mode              BOOLEAN DEFAULT FALSE,
+            failed_login_attempts     INTEGER DEFAULT 0,
+            locked_until              TIMESTAMP,
+            last_seen                 TIMESTAMP,
+            last_password_change      TIMESTAMP,
+            reset_token               TEXT,
+            reset_token_expires       TIMESTAMP,
+            created_at                TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_key TEXT PRIMARY KEY,
+            user_key    TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            device_info TEXT,
+            expires_at  TIMESTAMP NOT NULL,
+            created_at  TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_key);
+
+        CREATE TABLE IF NOT EXISTS posts (
+            post_key       TEXT PRIMARY KEY,
+            user_key       TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            post_type      TEXT DEFAULT 'text',
+            content        TEXT,
+            media_url      TEXT,
+            media_type     TEXT,
+            visibility     TEXT DEFAULT 'public',
+            allow_comments BOOLEAN DEFAULT TRUE,
+            show_in_feed   BOOLEAN DEFAULT TRUE,
+            is_pinned      BOOLEAN DEFAULT FALSE,
+            like_count     INTEGER DEFAULT 0,
+            comment_count  INTEGER DEFAULT 0,
+            share_count    INTEGER DEFAULT 0,
+            view_count     INTEGER DEFAULT 0,
+            edited_at      TIMESTAMP,
+            created_at     TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_posts_user    ON posts(user_key);
+        CREATE INDEX IF NOT EXISTS idx_posts_type    ON posts(post_type);
+        CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS post_extras (
+            post_key TEXT PRIMARY KEY REFERENCES posts(post_key) ON DELETE CASCADE,
+            data     JSONB DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS likes (
+            like_key   TEXT PRIMARY KEY,
+            post_key   TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(post_key, user_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            bookmark_key TEXT PRIMARY KEY,
+            post_key     TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key     TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            created_at   TIMESTAMP DEFAULT NOW(),
+            UNIQUE(post_key, user_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS follows (
+            follow_key    TEXT PRIMARY KEY,
+            follower_key  TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            following_key TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            created_at    TIMESTAMP DEFAULT NOW(),
+            UNIQUE(follower_key, following_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS blocks (
+            block_key   TEXT PRIMARY KEY,
+            blocker_key TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            blocked_key TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            blocked_at  TIMESTAMP DEFAULT NOW(),
+            UNIQUE(blocker_key, blocked_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS mutes (
+            muter_key  TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            muted_key  TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(muter_key, muted_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS comments (
+            comment_key TEXT PRIMARY KEY,
+            post_key    TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key    TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            parent_key  TEXT,
+            content     TEXT NOT NULL,
+            like_count  INTEGER DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_key);
+
+        CREATE TABLE IF NOT EXISTS comment_likes (
+            user_key    TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            comment_key TEXT NOT NULL REFERENCES comments(comment_key) ON DELETE CASCADE,
+            PRIMARY KEY(user_key, comment_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS poll_votes (
+            vote_key     TEXT PRIMARY KEY,
+            post_key     TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key     TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            option_index INTEGER NOT NULL,
+            created_at   TIMESTAMP DEFAULT NOW(),
+            UNIQUE(post_key, user_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS event_rsvps (
+            rsvp_key    TEXT PRIMARY KEY,
+            post_key    TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key    TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            rsvp_status TEXT,
+            created_at  TIMESTAMP DEFAULT NOW(),
+            UNIQUE(post_key, user_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS bounty_applications (
+            app_key    TEXT PRIMARY KEY,
+            post_key   TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            user_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            message    TEXT,
+            status     TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(post_key, user_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS post_applications (
+            application_key TEXT PRIMARY KEY,
+            post_key        TEXT NOT NULL REFERENCES posts(post_key) ON DELETE CASCADE,
+            applicant_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            note            TEXT,
+            status          TEXT DEFAULT 'pending',
+            created_at      TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_post_apps_post      ON post_applications(post_key);
+        CREATE INDEX IF NOT EXISTS idx_post_apps_applicant ON post_applications(applicant_key);
+
+        CREATE TABLE IF NOT EXISTS notifications (
+            notif_key     TEXT PRIMARY KEY,
+            recipient_key TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            sender_key    TEXT REFERENCES user_auth(user_key) ON DELETE SET NULL,
+            notif_type    TEXT NOT NULL,
+            post_key      TEXT,
+            message       TEXT,
+            is_read       BOOLEAN DEFAULT FALSE,
+            created_at    TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_notifs_recipient ON notifications(recipient_key);
+
+        CREATE TABLE IF NOT EXISTS conversations (
+            convo_key       TEXT PRIMARY KEY,
+            user_a_key      TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            user_b_key      TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            last_typing_key TEXT,
+            last_typing_at  TIMESTAMP,
+            created_at      TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_convos_users ON conversations(user_a_key, user_b_key);
+
+        CREATE TABLE IF NOT EXISTS messages (
+            msg_key      TEXT PRIMARY KEY,
+            convo_key    TEXT NOT NULL REFERENCES conversations(convo_key) ON DELETE CASCADE,
+            sender_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            content      TEXT,
+            media_url    TEXT,
+            media_type   TEXT,
+            reply_to_key TEXT,
+            is_read      BOOLEAN DEFAULT FALSE,
+            sent_at      TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(convo_key);
+
+        CREATE TABLE IF NOT EXISTS global_chat (
+            msg_key    TEXT PRIMARY KEY,
+            user_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            content    TEXT NOT NULL,
+            sent_at    TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS announcements (
+            announcement_key  TEXT PRIMARY KEY,
+            user_key          TEXT REFERENCES user_auth(user_key) ON DELETE SET NULL,
+            title             TEXT,
+            body              TEXT,
+            announcement_type TEXT DEFAULT 'update',
+            priority          TEXT DEFAULT 'normal',
+            created_at        TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS search_pairs (
+            pair_key      TEXT PRIMARY KEY,
+            query         TEXT NOT NULL,
+            selected      TEXT NOT NULL,
+            weight        FLOAT DEFAULT 1.0,
+            last_searched TIMESTAMP DEFAULT NOW(),
+            UNIQUE(query, selected)
+        );
+
+        CREATE TABLE IF NOT EXISTS reports (
+            report_key   TEXT PRIMARY KEY,
+            reporter_key TEXT REFERENCES user_auth(user_key) ON DELETE SET NULL,
+            target_type  TEXT,
+            target_key   TEXT,
+            reason       TEXT,
+            created_at   TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS ads (
+            ad_key     TEXT PRIMARY KEY,
+            title      TEXT,
+            content    TEXT,
+            image_url  TEXT,
+            link_url   TEXT,
+            active     BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS password_resets (
+            token      TEXT,
+            user_key   TEXT PRIMARY KEY REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            code       TEXT,
+            expires_at TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS email_verifications (
+            user_key   TEXT PRIMARY KEY REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            code       TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS user_tag_follows (
+            user_key   TEXT NOT NULL REFERENCES user_auth(user_key) ON DELETE CASCADE,
+            tag        TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(user_key, tag)
+        );
+        """)
+        conn.commit()
+        cur.close()
+        print('[Treℵds] Tables ready.')
+    except Exception as e:
+        conn.rollback()
+        print(f'[Treℵds] Table creation error: {e}')
+    finally:
+        release_conn(conn)
+
 # ═══════════════════════════════════════════════════════════════
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════
@@ -2529,4 +2823,4 @@ def Frontend_request_executor(x, token=None):
         return {'status': 400, 'message': A.Genericerror}
 
 # ── Startup ───────────────────────────────────────────────────
-#create_table()
+create_tables()
