@@ -824,8 +824,8 @@ def get_global_research(seen_keys=None):
             SELECT p.*, u.full_name, u.username, u.profilepicurl, u.account_level, pe.data as extras
             FROM posts p JOIN user_auth u ON u.user_key = p.user_key
             LEFT JOIN post_extras pe ON pe.post_key = p.post_key
-            WHERE p.post_type = 'research' AND p.visibility = 'public'
-            AND p.show_in_feed = TRUE AND p.post_key != ALL(%s)
+            WHERE p.post_type IN ('research','question','collab','grant','funding') AND p.visibility = 'public'
+            AND p.post_key != ALL(%s)
             ORDER BY p.created_at DESC LIMIT 20
         """, (seen_keys,))
         rows = cur.fetchall()
@@ -867,7 +867,7 @@ def generate_feed_sequence(n):
     post_count = 0
     last_type  = None
     streak     = 0
-    post_types = ['text', 'image', 'video', 'poll', 'event']
+    post_types = ['text', 'image', 'video', 'poll', 'event', 'grant', 'funding', 'collab', 'question']
     for i in range(n):
         if post_count > 0 and post_count % A.TRENDING_FREQUENCY == 0:
             sequence.append('trending_now')
@@ -959,6 +959,84 @@ def get_scored_posts(user_key, seen_keys=None, n=None, type_filter=None):
         random_posts   = remaining[:n - split]
         random.shuffle(random_posts)
         return (contextualized + random_posts)[:n]
+    finally:
+        release_conn(conn)
+
+
+
+def get_feed_v2(user_key, mode='social', seen_keys=None, n=None):
+    seen_keys = seen_keys or []
+    n         = n or A.FEED_INITIAL_COUNT
+    user      = get_user_by_key(user_key)
+    conn      = get_conn()
+
+    WEIGHTS = {
+        'social':   {'like':1,'comment':2,'share':1.5,'uni':20,'dept':15,'follow':40,'r1':50,'r6':30,'r24':10},
+        'academic': {'like':0.5,'comment':1.5,'share':1,'uni':35,'dept':30,'follow':40,'r1':40,'r6':25,'r24':10},
+        'finance':  {'like':0,'comment':0,'share':0,'uni':5,'dept':5,'follow':20,'r1':60,'r6':40,'r24':20},
+    }
+    w = WEIGHTS.get(mode, WEIGHTS['social'])
+
+    TYPE_FILTERS = {
+        'social':   '',
+        'academic': "AND p.post_type IN ('research','question','collab','grant','funding')",
+        'finance':  "AND p.post_type IN ('bounty','job','product','grant','funding')",
+    }
+    type_clause = TYPE_FILTERS.get(mode, '')
+
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT following_key FROM follows WHERE follower_key = %s", (user_key,))
+        following_keys = {row['following_key'] for row in cur.fetchall()}
+
+        cur.execute(f"""
+            SELECT p.*, u.full_name, u.username, u.profilepicurl,
+                   u.university, u.department, u.academic_level, u.account_level,
+                   pe.data as extras,
+                   EXISTS(SELECT 1 FROM likes l WHERE l.post_key=p.post_key AND l.user_key=%s) as is_liked,
+                   EXISTS(SELECT 1 FROM bookmarks bk WHERE bk.post_key=p.post_key AND bk.user_key=%s) as is_bookmarked,
+                   EXISTS(SELECT 1 FROM follows f WHERE f.follower_key=%s AND f.following_key=p.user_key) as is_following
+            FROM posts p
+            JOIN user_auth u ON u.user_key = p.user_key
+            LEFT JOIN blocks b ON (b.blocker_key=%s AND b.blocked_key=p.user_key)
+            LEFT JOIN post_extras pe ON pe.post_key = p.post_key
+            WHERE p.post_key != ALL(%s)
+            AND p.visibility = 'public'
+            AND b.blocker_key IS NULL
+            {type_clause}
+            ORDER BY p.created_at DESC LIMIT %s
+        """, (user_key, user_key, user_key, user_key, seen_keys, n * 4))
+
+        posts = [dict(p) for p in cur.fetchall()]
+        cur.close()
+
+        for post in posts:
+            post['time_ago'] = time_ago(post.get('created_at'))
+            if post.get('extras') is None:
+                post['extras'] = {}
+            score = 0
+            score += post.get('like_count',0)   * w['like']
+            score += post.get('comment_count',0) * w['comment']
+            score += post.get('share_count',0)   * w['share']
+            if post.get('university') == user.get('university'): score += w['uni']
+            if post.get('department') == user.get('department'): score += w['dept']
+            if post.get('user_key') in following_keys:           score += w['follow']
+            created_at = post.get('created_at')
+            if created_at:
+                try:
+                    diff = (datetime.utcnow() - created_at.replace(tzinfo=None)).total_seconds()
+                    if diff < 3600:    score += w['r1']
+                    elif diff < 21600: score += w['r6']
+                    elif diff < 86400: score += w['r24']
+                except: pass
+            post['score'] = score
+
+        posts.sort(key=lambda p: p['score'], reverse=True)
+        split = int(n * 0.8)
+        top   = posts[:split]
+        rest  = posts[split:]
+        random.shuffle(rest)
+        return (top + rest[:n - split])[:n]
     finally:
         release_conn(conn)
 
@@ -1406,6 +1484,8 @@ def create_post(x, token):
         elif post_type == 'collab':   extras = x.get('collab', {})
         elif post_type == 'question': extras = x.get('question', {})
         elif post_type == 'ad':       extras = x.get('ad', {})
+        elif post_type == 'grant':    extras = x.get('grant', {})
+        elif post_type == 'funding':  extras = x.get('funding', {})
         if hashtags:
             extras['hashtags'] = hashtags
         if extras:
@@ -2147,6 +2227,16 @@ def Frontend_request_executor(x, token=None):
         posts       = get_scored_posts(user_key, seen_keys, n, type_filter)
         sequence    = generate_feed_sequence(n)
         return {'status': 200, 'posts': posts, 'sequence': sequence}
+
+    elif status == 'get_feed_v2':
+        user_key = validate_session(token)
+        if not user_key:
+            return {'status': 401, 'message': A.Unauthorizedmessage}
+        seen_keys = x.get('seen_keys', [])
+        n         = x.get('n', A.FEED_SCROLL_COUNT)
+        mode      = x.get('mode', 'social')
+        posts     = get_feed_v2(user_key, mode, seen_keys, n)
+        return {'status': 200, 'posts': posts}
 
     elif status == 'get_suggestions':
         user_key = validate_session(token)
