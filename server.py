@@ -92,7 +92,7 @@ def init_db():
             startup_id INTEGER REFERENCES startuphive_startups(id) ON DELETE CASCADE UNIQUE,
             about_problem TEXT, about_solution TEXT, about_why_now TEXT,
             about_business_model TEXT, traction_summary TEXT,
-            tech_stack TEXT[] DEFAULT '{}', documentation_url VARCHAR(500),
+            tech_stack TEXT[] DEFAULT '{}', video_url VARCHAR(500), documentation_url VARCHAR(500),
             roadmap_now TEXT, roadmap_next TEXT, roadmap_later TEXT,
             competitors TEXT[] DEFAULT '{}',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -291,6 +291,14 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx3_upd_s       ON startuphive_updates(startup_id, created_at DESC)",
     ]
     for stmt in idx: cur.execute(stmt)
+    # Migrations for existing DBs — add missing columns safely
+    migrations = [
+        "ALTER TABLE startuphive_startup_content ADD COLUMN IF NOT EXISTS video_url VARCHAR(500)",
+        "ALTER TABLE startuphive_startup_content ADD COLUMN IF NOT EXISTS competitors TEXT[] DEFAULT '{}'",
+    ]
+    for m in migrations:
+        try: cur.execute(m)
+        except Exception: db.rollback()
     db.commit(); cur.close()
     print("✅ startuphive_ schema v3 ready — 22 tables")
 
@@ -611,17 +619,30 @@ def create_startup():
          d.get("location_based",""),json.dumps(d.get("location_reach",["Global"])),
          d.get("founded_date",""),d.get("team_size",1),d.get("demo_url",""),
          d.get("video_url",""),json.dumps(d.get("contact_methods",{})),
-         d.get("logo_url",""),d.get("cover_url",""),d.get("needs",[])))
+         d.get("logo_url","") or "",d.get("cover_url","") or "",
+         [str(x) for x in d.get("needs",[]) if x] if d.get("needs") else []))
     sid=cur.fetchone()["id"]
     c=d.get("content",{})
+    # Ensure tech_stack is a proper list of strings
+    ts = c.get("tech_stack",[])
+    if isinstance(ts, str): ts = [x.strip() for x in ts.split(',') if x.strip()]
+    elif not isinstance(ts, list): ts = []
     cur.execute("""INSERT INTO startuphive_startup_content
         (startup_id,about_problem,about_solution,about_why_now,about_business_model,
          traction_summary,tech_stack,video_url,documentation_url,roadmap_now,roadmap_next,roadmap_later)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (sid,c.get("about_problem",""),c.get("about_solution",""),c.get("about_why_now",""),
-         c.get("about_business_model",""),c.get("traction_summary",""),c.get("tech_stack",[]),
-         c.get("video_url",""),c.get("documentation_url",""),c.get("roadmap_now",""),
-         c.get("roadmap_next",""),c.get("roadmap_later","")))
+        (sid,
+         c.get("about_problem","") or "",
+         c.get("about_solution","") or "",
+         c.get("about_why_now","") or "",
+         c.get("about_business_model","") or "",
+         c.get("traction_summary","") or "",
+         ts,
+         c.get("video_url","") or "",
+         c.get("documentation_url","") or "",
+         c.get("roadmap_now","") or "",
+         c.get("roadmap_next","") or "",
+         c.get("roadmap_later","") or ""))
     db.commit(); cur.close()
     log_act("startup_listed",g.uid,sid,{"name":name})
     return jsonify({"success":True,"id":sid,"slug":slug}), 201
@@ -651,7 +672,7 @@ def update_startup(sid):
         cur.execute(f"UPDATE startuphive_startups SET {sets},updated_at=NOW() WHERE id=%s",list(updates.values())+[sid])
     c=d.get("content")
     if c:
-        ca=["about_problem","about_solution","about_why_now","about_business_model","traction_summary","tech_stack","documentation_url","roadmap_now","roadmap_next","roadmap_later","competitors"]
+        ca=["about_problem","about_solution","about_why_now","about_business_model","traction_summary","tech_stack","video_url","documentation_url","roadmap_now","roadmap_next","roadmap_later","competitors"]
         cu={k:v for k,v in c.items() if k in ca}
         if cu:
             cur.execute("SELECT id FROM startuphive_startup_content WHERE startup_id=%s",(sid,))
