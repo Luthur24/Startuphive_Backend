@@ -173,7 +173,6 @@ Security Considerations
 
 The application uses token-based authentication and ownership checks for protected operations.
 
-Production deployments should keep all secrets, database credentials, signing keys, and other sensitive configuration outside the source code using environment variables or a dedicated secret-management system.
 
 Project Status
 
